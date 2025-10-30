@@ -1,0 +1,46 @@
+# Remediation Plan for error4.txt (RuntimeError: Float vs BFloat16)
+
+## 1. Reproduce & Capture
+- Run `py -m cli.main eval` in `G:\ossc` (already captured in `error4.txt`).
+- Confirm the traceback ends with `RuntimeError('expected scalar type Float but found BFloat16')`.
+
+## 2. Error Classification
+- **Type**: RuntimeError during model generation.
+- **Message**: Expected Float tensor but received BFloat16 tensor.
+- **Impact**: Stops the evaluation pipeline; no output is produced.
+
+## 3. Affected Modules & Files
+- `cli/main.py:53` – entry point invoking `asyncio.run(report.run(...))`.
+- `evals/report.py:27` – prepares prompts and calls `model.generate`.
+- `gpt_oss_ws/model_wrapper.py:144` – wrapper around `generate_with_workspace`.
+- `gpt_oss_ws/generation.py` – core generation loop handling KV caches.
+- `configs/server.yaml` – contains `bf16_fallback: true` and quantization settings.
+
+## 4. Root‑Cause Hypothesis
+- The workspace aligns virtual KV tensors to **float32** (`key=torch.float32, value=torch.float32`) but later passes **bfloat16** tensors (`input_ids`/`past_key_values`) into the model without conversion.
+- `bf16_fallback=True` forces the model to operate in BFloat16, while parts of the generation code still expect Float.
+- Missing Triton kernels cause the fallback, exposing the dtype mismatch.
+
+## 5. Prioritized Fixes
+1. **High** – Ensure dtype consistency:
+   - Convert KV tensors and any cached tensors to `torch.float32` before feeding them to the model.
+   - Add explicit `.to(torch.float32)` in `generation.generate_with_workspace` after cache retrieval.
+2. **Medium** – Adjust configuration:
+   - Set `bf16_fallback: false` in `configs/server.yaml` to force Float32 execution.
+   - Verify that the model runs without the BFloat16 path.
+3. **Low** – Provide proper Triton support:
+   - Install Triton >= 3.4.0 (`pip install triton` or appropriate Windows wheel).
+   - Re‑enable MXFP4 quantization to avoid fallback.
+
+## 6. Concrete Task List for `error_resolver`
+- **T1**: Open `gpt_oss_ws/generation.py` and locate the loop where `outputs = model.model(... )` is called. Insert dtype conversion for `past_key_values` and any intermediate tensors.
+- **T2**: In `gpt_oss_ws/model_wrapper.py`, after `model.generate` returns, ensure the final output tensor is cast to `float32` if needed.
+- **T3**: Edit `configs/server.yaml` – change `bf16_fallback: false` and optionally set `quantization: none`.
+- **T4**: Add a small unit test under `tests/` that loads the model with the current config, runs a single generation step, and asserts `output.dtype == torch.float32`.
+- **T5**: (Optional) Install Triton on the host machine and verify that the original MXFP4 path works without fallback.
+
+## 7. Hand‑off Artifact
+- The full plan is saved to `G:\ossc\error_resolver_plan.txt` for the next agent.
+
+---
+*Prepared by the mission_planner. Next step: apply the tasks or hand off to the error_resolver.*

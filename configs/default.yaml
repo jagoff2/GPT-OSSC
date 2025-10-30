@@ -1,0 +1,29 @@
+﻿model_name: openai/gpt-oss-20b
+quantization: Mxfp4
+device_map: auto
+hooked_layers: [1, 5, 9, 13, 17, 21]
+nvirt: 4
+residual_rank: 8
+slot_count: 6
+slot_dim: 256
+slot_iterations: 1
+enable_kv_append: true
+enable_residual_delta: true
+enable_read_probes: true
+enable_broadcast: true
+workspace_device: cpu
+retention:
+  virt_kv_max_tokens_per_layer: 1024
+  virt_kv_ttl_steps: 2048
+  spill_to_cpu: true
+  prefetch_margin: 16
+log_level: INFO
+api_host: 0.0.0.0
+api_port: 8000
+controller_entropy_floor: 2.5
+controller_norm_cap: 4.5
+sqlite_path: workspace_memory.sqlite
+faiss_index_path: workspace_memory.faiss
+memory_embedding_dim: 384
+max_context_tokens: 8192
+bf16_fallback: true

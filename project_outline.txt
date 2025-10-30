@@ -1,0 +1,246 @@
+
+
+**You are an expert Python engineer. Generate a production-ready Python 3.11 package that implements a latent global workspace for `openai/gpt-oss-20b` (Hugging Face) with persistent KV-append and residual-delta hooks. No base-weight finetuning. The package must run on 30 GB VRAM across two GPUs and 192 GB system RAM. It must expose an OpenAI-compatible HTTP API with streaming and include a CLI, configs, tests, and eval scripts. Follow the spec below exactly.**
+
+### Environment and constraints
+
+* Model: `openai/gpt-oss-20b` via Hugging Face Transformers.
+* Quantization: 4-bit (bitsandbytes). Prefer BF16 compute when available. `device_map` supported.
+* KV cache: allow CPU spill and sliding windows for both real and virtual KV. No hard text context cap and no early exits based on context length.
+* Added modules must be tiny. Per-step hook compute must be minimal. Defaults should keep throughput high on a single request.
+* Persistent **virtual KV-append** is required. Do not make it ephemeral. Provide retention controls rather than removal.
+
+### GPT-OSS-20B specifics to honor
+
+* 24 transformer blocks.
+* GQA: `num_attention_heads=64`, `num_key_value_heads=8`, `head_dim=64`.
+* Alternating attention topology: sliding-window vs full-attention per layer.
+* **Hook only full-attention layers**: indices `{1, 5, 9, 13, 17, 21}` (0-indexed).
+
+### High-level architecture
+
+* Workspace (W_t): 6–8 slots × 256–384 dim. Slot-Attention with a single iteration.
+* Read probes: linear projections from **post-attention residuals** at the hooked layers. Aggregate across layers to form candidates for Slot-Attention.
+* Write hooks:
+
+  1. **KV-append**: synthesize **virtual** K,V from (W_t) and **concatenate** them to `past_key_values` at each hooked layer. Persistent across steps, subject to retention policy.
+  2. **Residual-delta**: low-rank update applied to the last-token residual after attention at those layers.
+* Controller + Metacognition: tiny heuristics or MLP to gate broadcast, memory retrieve/write, ask/continue/halt.
+* Memory: SQLite + FAISS in system RAM. Retrieval updates (W_t) primarily. Only compress ≤200 tokens into the prompt when strictly needed.
+
+### Shapes and placement
+
+* Virtual KV per hooked layer per batch: `[B, 8, Nvirt, 64]`. Start with `Nvirt=4`. Maintain persistence with a capped retention policy.
+* Residual-delta on the **last token only**. Hidden size `2880`.
+* Workspace, controller, memory, probes CPU by default. Allow pinning small modules to GPU0 if headroom exists.
+
+### Modules to implement
+
+1. **Hooked wrapper**
+
+   * Load `openai/gpt-oss-20b` in 4-bit and patch only the selected full-attention layers.
+   * Feature flags to enable or disable: KV-append, Residual-delta, Read-probes, Broadcast gate.
+   * Preserve HF caching and generation API semantics. Support streaming logits for the server.
+
+2. **Attention patching**
+
+   * For hooked layers, **concatenate** the virtual `K_ws, V_ws` with the real K,V **in the cache** and compute attention over both.
+   * Respect GQA shapes. Implement a safe SDPA path for hooked layers if flash kernels cannot accept the concatenated KV. Other layers must remain on fast paths.
+
+3. **Residual-delta hook**
+
+   * Low-rank update `Δh = U_l σ(A_l W_t) V_l^T`, rank 8–16.
+   * Apply post-attention on the last token at selected layers.
+   * Include magnitude regularization and per-layer gating to preserve fluency.
+
+4. **Read probes**
+
+   * At each hooked layer, read post-attention residual, project to 128-d features via a learned linear.
+   * Aggregate the features across layers into a single candidate set for Slot-Attention.
+
+5. **Workspace (Slot-Attention)**
+
+   * 6–8 slots, 256–384 dim, single iteration.
+   * Inputs: probe features and optional memory/tool observations.
+   * Output (W_t) is consumed by KV projector, residual-delta projector, and controller.
+
+6. **KV projector**
+
+   * From (W_t), synthesize virtual K,V with shape `[B, 8, Nvirt, 64]` per hooked layer.
+   * Support shared or per-layer parameters. Provide L2 and sparsity regularization options to discourage always-on broadcast.
+   * Provide a **retention policy** for virtual KV:
+
+     * Configurable `virt_kv_max_tokens_per_layer` and `virt_kv_ttl_steps`.
+     * Implement **sliding window retention** for virtual KV separate from real tokens.
+     * Allow CPU spill and prefetch for virtual KV segments. Use pinned memory.
+
+7. **Controller + Metacognition**
+
+   * Inputs: (W_t), average token entropy, tool/memory statuses.
+   * Actions: broadcast gate on/off, retrieve, write, ask, continue, halt.
+   * Provide initial entropy-threshold heuristics. Support swapping to a tiny MLP.
+
+8. **Memory subsystem**
+
+   * SQLite for metadata, FAISS for vectors. Small CPU embedding model.
+   * Store episodic tuples `(time, goal, decision, outcome, ws_snapshot, tags)` and semantic summaries.
+   * Retrieval updates (W_t); inject compact text only when essential and within a strict token budget.
+
+### OpenAI-compatible API
+
+* HTTP server with OpenAI-compatible endpoints:
+
+  * `POST /v1/chat/completions` (primary), `POST /v1/completions` (optional), `GET /v1/models`, `GET /healthz`.
+* Support streaming via SSE with `stream=true` and non-streaming.
+* Accept common fields: `model`, `messages`/`prompt`, `max_tokens`, `temperature`, `top_p`, `stop`, `presence_penalty`, `frequency_penalty`, `logprobs`, etc.
+* Return JSON matching OpenAI schema including `choices`, `usage`, `finish_reason`.
+* Add request-level `extra` config to control hooks: enable or disable KV-append and residual-delta, set `Nvirt`, control gates, set memory limits. Extras must be safely ignored by OpenAI clients that do not expect them.
+
+### Runtime decode loop
+
+For each decode step:
+
+1. From each hooked layer, capture post-attention residual on the last token. Run read probes to produce 128-d features.
+2. Aggregate features and update (W_t) via single-iteration Slot-Attention.
+3. If the controller gate is on, project (W_t) to virtual `K_ws, V_ws` and **append** them into `past_key_values` for each hooked layer according to the retention policy. Update masks so the current token can attend to these virtual slots.
+4. Apply residual-delta on the last token at those layers.
+5. Controller decides whether to retrieve or write to memory this step and whether to ask, continue, or halt.
+6. Continue generation.
+
+### Configuration
+
+* YAML or JSON config for:
+
+  * Hooked layer indices, `Nvirt`, low-rank ranks and dims, gating thresholds, memory limits.
+  * Retention settings: `virt_kv_max_tokens_per_layer`, `virt_kv_ttl_steps`, CPU spill on or off.
+  * CPU/GPU placement for probes, workspace, controller.
+  * API server settings (host, port, timeouts, concurrency).
+
+### CLI entrypoints
+
+* `serve` to start the OpenAI-compatible server with streaming.
+* `eval` to run task metrics and fluency guard.
+* `fluency-guard` to compute perplexity and QA parity vs the unhooked baseline.
+
+### Logging and observability
+
+* Structured logs per step: gate activations, norms of Δh per layer, virtual KV norms, entropy, memory hits, current retention counts per layer.
+* Health endpoint returns hook enablement and memory pressure stats.
+
+### Evaluation requirement
+
+* **Fluency guard**: compare perplexity and basic QA vs **unhooked** GPT-OSS-20B at the same quantization. Regression must be within a small tolerance.
+* Report task-level metrics showing a **clear, noticeable gain** on long-horizon, tool-using tasks while preserving fluency.
+
+### Performance and safety guards
+
+* Hard cap on `Nvirt` (default 4).
+* L2 and sparsity regularization knobs on virtual KV and residual deltas.
+* Toggle to fall back to the unhooked model for sanity checks.
+* Sliding window retention for both real KV and virtual KV. CPU spill allowed with pinned memory.
+
+### Project layout (create these files with solid implementations and docstrings)
+
+```
+gpt_oss_ws/
+  __init__.py
+  config.py
+  device_map.py
+  logging_utils.py
+  types.py
+
+  model_wrapper.py          # load model, patch hooks, manage caches and masks
+  attention_patch.py        # concat virtual KV into past_key_values at hooked layers
+  residual_delta.py         # low-rank Δh with gating and norm budget
+  probes.py                 # linear probes producing 128-d features per hooked layer
+  workspace.py              # Slot-Attention (6–8 slots, 256–384 dim)
+  kv_projector.py           # W_t -> K_ws, V_ws with GQA-correct shapes and retention
+  controller.py             # heuristic/MLP gate and decisions (broadcast, retrieve, write)
+  memory.py                 # SQLite + FAISS; episodic tuples and semantic summaries
+  api_server.py             # FastAPI server; OpenAI-compatible endpoints; SSE streaming
+  generation.py             # step loop integrating all modules
+  masks.py                  # causal masks extended with virtual KV positions
+  scheduling.py             # retention and spill policies (real and virtual KV)
+  utils/
+    tensor_ops.py
+    quant_utils.py
+    sdpa_utils.py
+    entropy.py
+
+configs/
+  default.yaml
+  server.yaml
+  hooks_off.yaml
+  eval_tasks.yaml
+
+cli/
+  __init__.py
+  main.py                   # click/typer commands: serve, eval, fluency-guard
+
+evals/
+  fluency_guard.py          # PPL and QA parity vs baseline
+  tasks_long_horizon.py     # tool-using tasks
+  report.py                 # tables and summaries
+
+tests/
+  test_shapes.py
+  test_masks.py
+  test_retention.py
+  test_residual_delta.py
+  test_attention_patch.py
+  test_api_compat.py
+  test_streaming.py
+  test_memory.py
+  test_controller.py
+
+pyproject.toml
+README.md
+```
+
+### Key implementation details
+
+* **Hook detection**: verify at runtime that `{1,5,9,13,17,21}` are full-attention layers. If not, raise with a clear message. Provide a config override.
+* **GQA handling**: generate virtual KV as `[B, num_kv_heads=8, Nvirt, head_dim=64]`. If using shared projectors, learn per-group scales. Start with zero-init plus small gain.
+* **Masks**: extend attention masks to include virtual KV positions while maintaining causality. Unit tests must prove no future leakage.
+* **Retention**:
+
+  * Maintain a per-layer deque of virtual KV segments with timestamps and lengths.
+  * Enforce `virt_kv_max_tokens_per_layer` and `virt_kv_ttl_steps`.
+  * Spill oldest virtual KV segments to CPU with pinned memory. Prefetch when the controller expects reuse.
+* **Data movement**: batch probe features across layers before device transfers. If probes/workspace/controller are on GPU0, keep them there to avoid per-step CPU round trips.
+* **Residual-delta**: rank 8–16, scale small at start, gated by entropy and per-layer norms.
+* **API**: implement exact response schema for `chat.completions`, including SSE chunk formatting and `usage` fields. Extras live under `extra` and are optional.
+* **Concurrency**: support a configurable worker pool. Gracefully degrade when VRAM is tight by reducing `Nvirt` and applying stricter retention.
+
+### Unit tests and acceptance tests
+
+* **Shapes and masks**: verify KV shapes and that causal masking holds with virtual KV appended.
+* **Cache growth**: verify that `past_key_values` reflect appended virtual KV counts following retention limits.
+* **Throughput**: tokens/s at 2k, 4k, 8k context with hooks on vs off. Hooks overhead ≤ 20% at 2k, ≤ 35% at 4k on batch=1.
+* **Fluency parity**: PPL delta ≤ 3% and QA delta ≤ 1 point vs unhooked baseline (same quant).
+* **Quality**: long-horizon tool tasks show a clear, noticeable gain or reduced retries at fixed budgets.
+* **API compatibility**: golden tests for streaming and non-streaming responses against OpenAI SDKs.
+* **Memory**: tests for SQLite+FAISS I/O, episodic tuple writes, retrieval, and W_t updates.
+
+### Example config defaults (put in `configs/default.yaml`)
+
+* Hooked layers: `[1,5,9,13,17,21]`
+* Nvirt: 4
+* Residual-delta rank: 8
+* Slot count: 6, slot dim: 256, iterations: 1
+* Retention: `virt_kv_max_tokens_per_layer: 1024`, `virt_kv_ttl_steps: 2048`
+* CPU spill: true
+* Probes/workspace/controller device: `cpu`
+* API server: host `0.0.0.0`, port `8000`
+* Gating thresholds: reasonable entropy floor and norm caps
+
+### Deliverables
+
+* Installable Python package with the above module structure.
+* Hooked wrapper limited to selected full-attention layers.
+* Configurable workspace, probes, projectors, controller, memory.
+* OpenAI-compatible REST server with streaming and model listing.
+* CLI to run server, fluency guard, and evaluations.
+* Documentation covering shapes, hooks, API usage, gating controls, and how to extend to more layers if VRAM permits.
+
+**Generate all files with complete, well-documented implementations, not placeholders. Include comments at key tensor shape transforms and mask edits. Ensure the package runs with `pip install -e .` and `python -m cli.main serve --config configs/server.yaml`.**

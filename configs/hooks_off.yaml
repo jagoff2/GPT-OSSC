@@ -1,0 +1,9 @@
+model_name: openai/gpt-oss-20b
+quantization: mxfp4
+device_map: auto
+hooked_layers: [1, 5, 9, 13, 17, 21]
+enable_kv_append: false
+enable_residual_delta: false
+enable_read_probes: false
+enable_broadcast: false
+log_level: INFO

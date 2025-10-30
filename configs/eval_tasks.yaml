@@ -1,0 +1,13 @@
+﻿tasks:
+  - name: planning-tool
+    prompt: "User: Plan a three-step approach to research a new topic.\nassistant:"
+    expected: "step"
+    max_new_tokens: 128
+    temperature: 0.7
+    top_p: 0.9
+  - name: tool-memory
+    prompt: "User: Summarize the previous session notes referencing key decisions.\nassistant:"
+    expected: "summary"
+    max_new_tokens: 128
+    temperature: 0.7
+    top_p: 0.9

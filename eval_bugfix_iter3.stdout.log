@@ -1,0 +1,3 @@
+[workspace-debug] layer=1 hidden_states=torch.bfloat16 past=None virtual=torch.bfloat16
+[kv-proxy] key_states dtype=torch.bfloat16 virtual_k dtype=torch.bfloat16
+workspace virtual KV dtype alignment: real_k=torch.bfloat16, real_v=torch.bfloat16, virtual_k=torch.bfloat16, virtual_v=torch.bfloat16, target_key=torch.bfloat16, target_value=torch.bfloat16
