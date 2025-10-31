@@ -10,7 +10,13 @@ from .scheduling import VirtualKVSegment, VirtualKVStore
 
 
 class VirtualKVProjector(nn.Module):
-  def __init__(self, config: WorkspaceConfig, hidden_size: int, target_dtype: torch.dtype) -> None:
+  def __init__(
+    self,
+    config: WorkspaceConfig,
+    hidden_size: int,
+    target_dtype: torch.dtype,
+    workspace_dtype: Optional[torch.dtype] = None,
+  ) -> None:
     super().__init__()
     self.config = config
     self.hidden_size = hidden_size
@@ -19,12 +25,26 @@ class VirtualKVProjector(nn.Module):
     self.nvirt = config.nvirt
     proj_dim = self.kv_heads * self.nvirt * self.head_dim * 2
     self.linear = nn.Linear(config.slot_dim, proj_dim)
-    nn.init.zeros_(self.linear.weight)
+    nn.init.orthogonal_(self.linear.weight)
+    self.linear.weight.data *= 0.02
     nn.init.zeros_(self.linear.bias)
     self.layer_ids = list(config.hooked_layers)
     self.layer_to_slot: Dict[int, int] = {layer: idx for idx, layer in enumerate(self.layer_ids)}
     self.store = VirtualKVStore(len(self.layer_ids), config.retention)
-    self.output_dtype = target_dtype
+    self.output_dtype = workspace_dtype or target_dtype
+    if workspace_dtype is not None and self.linear.weight.dtype != workspace_dtype:
+      self.linear = self.linear.to(dtype=workspace_dtype)
+
+    total = self.kv_heads * self.nvirt * self.head_dim
+    slot_dim = config.slot_dim
+    freq = torch.arange(slot_dim, dtype=torch.float32).unsqueeze(1)
+    span = torch.arange(total, dtype=torch.float32).unsqueeze(0) + 1.0
+    plan_key_matrix = torch.sin(freq * span * torch.pi / max(slot_dim, 1))
+    plan_val_matrix = torch.cos((freq + 0.5) * span * torch.pi / max(slot_dim, 1))
+    plan_key_matrix = plan_key_matrix / plan_key_matrix.norm(dim=0, keepdim=True).clamp_min(1e-6)
+    plan_val_matrix = plan_val_matrix / plan_val_matrix.norm(dim=0, keepdim=True).clamp_min(1e-6)
+    self.register_buffer("plan_key_matrix", plan_key_matrix.to(dtype=self.output_dtype))
+    self.register_buffer("plan_value_matrix", plan_val_matrix.to(dtype=self.output_dtype))
 
   def forward(
     self,
@@ -32,14 +52,26 @@ class VirtualKVProjector(nn.Module):
     layer_idx: int,
     device: str,
     target_dtype: Optional[torch.dtype] = None,
+    plan_energy: Optional[torch.Tensor] = None,
   ) -> VirtualKVSegment:
     slot_idx = self.layer_to_slot[layer_idx]
     bsz = slots.size(0)
+    linear_dtype = self.linear.weight.dtype
+    if slots.dtype != linear_dtype:
+      slots = slots.to(dtype=linear_dtype)
     pooled = slots.mean(dim=1)
     projected = self.linear(pooled)
     total = self.kv_heads * self.nvirt * self.head_dim
     key_flat = projected[:, :total]
     value_flat = projected[:, total:]
+    if plan_energy is not None:
+      base_dtype = pooled.dtype
+      pe = plan_energy.to(base_dtype)
+      plan_drive = torch.matmul(pooled, self.plan_key_matrix).to(base_dtype)
+      plan_weight = torch.sigmoid(pe.unsqueeze(-1))
+      key_flat = key_flat + plan_weight * plan_drive
+      plan_value_drive = torch.matmul(pooled, self.plan_value_matrix).to(base_dtype)
+      value_flat = value_flat + plan_weight * plan_value_drive
     key = key_flat.view(bsz, self.kv_heads, self.nvirt, self.head_dim)
     value = value_flat.view(bsz, self.kv_heads, self.nvirt, self.head_dim)
     dtype = target_dtype or self.output_dtype

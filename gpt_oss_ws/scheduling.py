@@ -4,7 +4,7 @@ import dataclasses
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, Optional
+from typing import Any, Deque, Dict, Iterable, Optional
 
 import torch
 
@@ -37,9 +37,16 @@ class VirtualKVStore:
     self.cfg = cfg
     self.layers: Dict[int, Deque[VirtualKVSegment]] = {i: deque() for i in range(num_layers)}
     self.step: int = 0
+    ttl = max(cfg.virt_kv_ttl_steps, 1)
+    self.decay = float(torch.exp(torch.tensor(-1.0 / ttl)))
 
   def advance(self) -> None:
     self.step += 1
+    decay = self.decay
+    for queue in self.layers.values():
+      for segment in queue:
+        segment.key.mul_(decay)
+        segment.value.mul_(decay)
 
   def append(self, layer: int, segment: VirtualKVSegment) -> None:
     queue = self.layers[layer]
@@ -71,9 +78,62 @@ class VirtualKVStore:
       queue.popleft()
       total = sum(segment.length for segment in queue)
 
-  def state_dict(self) -> Dict[int, Iterable[VirtualKVSegment]]:
-    return {layer: list(segments) for layer, segments in self.layers.items()}
+  def _clone_segment(self, segment: VirtualKVSegment) -> VirtualKVSegment:
+    return VirtualKVSegment(
+      key=segment.key.detach().clone(),
+      value=segment.value.detach().clone(),
+      created_step=segment.created_step,
+      ttl_steps=segment.ttl_steps,
+      device=segment.device,
+    )
+
+  def state_dict(self) -> Dict[str, Any]:
+    payload_layers: Dict[int, Iterable[Dict[str, Any]]] = {}
+    for layer, segments in self.layers.items():
+      cloned_segments = [
+        {
+          "key": segment.key.detach().clone(),
+          "value": segment.value.detach().clone(),
+          "created_step": segment.created_step,
+          "ttl_steps": segment.ttl_steps,
+          "device": segment.device,
+        }
+        for segment in segments
+      ]
+      payload_layers[layer] = cloned_segments
+    return {"step": self.step, "layers": payload_layers}
 
   def load_state_dict(self, state_dict) -> None:
-    for layer, items in state_dict.items():
-      self.layers[layer] = deque(items)
+    if not isinstance(state_dict, dict):
+      raise TypeError("VirtualKVStore.load_state_dict expects a dict payload")
+
+    raw_layers = state_dict.get("layers")
+    if raw_layers is None:
+      # backward compatibility with older format {str(layer): [segments], "step": step}
+      raw_layers = {
+        int(layer): value for layer, value in state_dict.items() if layer != "step"
+      }
+    else:
+      raw_layers = {int(layer): value for layer, value in raw_layers.items()}
+
+    self.step = int(state_dict.get("step", self.step))
+    for layer in self.layers:
+      self.layers[layer].clear()
+      layer_segments = raw_layers.get(layer, [])
+      new_queue: Deque[VirtualKVSegment] = deque()
+      for segment in layer_segments:
+        if isinstance(segment, VirtualKVSegment):
+          cloned = self._clone_segment(segment)
+        else:
+          key_tensor = segment["key"].detach().clone()
+          value_tensor = segment["value"].detach().clone()
+          device = segment.get("device", str(key_tensor.device))
+          cloned = VirtualKVSegment(
+            key=key_tensor,
+            value=value_tensor,
+            created_step=segment["created_step"],
+            ttl_steps=segment["ttl_steps"],
+            device=device,
+          )
+        new_queue.append(cloned)
+      self.layers[layer] = new_queue

@@ -27,22 +27,27 @@ async def compare(baseline_cfg: WorkspaceConfig, workspace_cfg: WorkspaceConfig,
   workspace_scores: List[float] = []
 
   for prompt in prompts:
-    input_ids = baseline_model.tokenizer_encode(prompt)
+    messages = [{"role": "user", "content": prompt}]
+    input_ids, attention_mask = baseline_model.prepare_chat_inputs(messages, add_generation_prompt=False)
     ctx = GenerationRequestContext(request_id="baseline", toggles=HookToggles(False, False, False, False))
 
+    input_ids_device = input_ids.to(baseline_model.primary_device())
+    attention_mask_device = attention_mask.to(baseline_model.primary_device())
     with torch.no_grad():
-      outputs = baseline_model.model(input_ids=input_ids, use_cache=False)
+      outputs = baseline_model.model(input_ids=input_ids_device, attention_mask=attention_mask_device, use_cache=False)
     log_probs = torch.log_softmax(outputs.logits[:, :-1, :], dim=-1)
-    target = input_ids[:, 1:]
+    target = input_ids_device[:, 1:]
     neg_log_likelihood = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).mean().item()
     baseline_scores.append(neg_log_likelihood)
 
-    workspace_ids = workspace_model.tokenizer_encode(prompt)
+    workspace_ids, workspace_mask = workspace_model.prepare_chat_inputs(messages, add_generation_prompt=False)
     ws_ctx = GenerationRequestContext(request_id="workspace", toggles=HookToggles(True, True, True, True))
+    workspace_ids_device = workspace_ids.to(workspace_model.primary_device())
+    workspace_mask_device = workspace_mask.to(workspace_model.primary_device())
     with torch.no_grad():
-      ws_outputs = workspace_model.model(input_ids=workspace_ids, use_cache=False)
+      ws_outputs = workspace_model.model(input_ids=workspace_ids_device, attention_mask=workspace_mask_device, use_cache=False)
     ws_log_probs = torch.log_softmax(ws_outputs.logits[:, :-1, :], dim=-1)
-    ws_target = workspace_ids[:, 1:]
+    ws_target = workspace_ids_device[:, 1:]
     ws_nll = -ws_log_probs.gather(-1, ws_target.unsqueeze(-1)).squeeze(-1).mean().item()
     workspace_scores.append(ws_nll)
 

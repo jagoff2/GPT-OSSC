@@ -23,8 +23,13 @@ async def run(task: str, config: WorkspaceConfig) -> None:
     prompts = ["Describe how the workspace controller decides to broadcast."]
   request_ctx = GenerationRequestContext(request_id=str(time.time()), toggles=HookToggles(True, True, True, True))
   for prompt in prompts:
-    input_ids = model.tokenizer_encode(prompt)
-    outputs = model.generate(request_ctx, input_ids=input_ids, max_new_tokens=128)
-    text = model.tokenizer_decode(outputs[0])
+    messages = [{"role": "user", "content": prompt}]
+    input_ids, attention_mask = model.prepare_chat_inputs(messages, add_generation_prompt=True)
+    prompt_tokens = input_ids.shape[-1]
+    outputs = model.generate(request_ctx, input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=128)
+    parsed = model.decode_generated(outputs[0], prompt_tokens)
+    text = (parsed.final or "").strip()
+    if not text:
+      text = model.tokenizer_decode(outputs[0, prompt_tokens:])
     print(json.dumps({"prompt": prompt, "completion": text}))
   model.close()

@@ -14,8 +14,8 @@ def load_quantized_model(config: WorkspaceConfig) -> AutoModelForCausalLM:
     load_in_4bit = False
     quantization_config: Dict[str, Any] = {}
     if config.quantization == "Mxfp4":
-        torch_dtype = torch.bfloat16
-        # MXFP4 quantization is not supported directly; we fallback to bfloat16
+        torch_dtype = torch.float32
+        # MXFP4 quantization is not supported on this runtime; fall back to float32 for compatibility
     elif config.quantization == "fp32":
         torch_dtype = torch.float32
     elif config.quantization == "bnb-4bit":

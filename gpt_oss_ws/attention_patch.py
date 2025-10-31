@@ -38,9 +38,12 @@ class WorkspaceRuntimeState:
   device: str = "cpu"
   slots: Optional[torch.Tensor] = None
   entropy: float = 0.0
+  model_dtype: Optional[torch.dtype] = None
 
 
-def _append_virtual_to_past(past: Optional[Tuple[torch.Tensor, torch.Tensor]], virtual_k: torch.Tensor, virtual_v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _append_virtual_to_past(
+  past: Optional[Tuple[torch.Tensor, torch.Tensor]], virtual_k: torch.Tensor, virtual_v: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
   if past is None:
     return virtual_k, virtual_v
   real_k, real_v = past
@@ -135,21 +138,74 @@ class AttentionPatcher:
   def patch(self, module: torch.nn.Module) -> None:
     if hasattr(module, "_workspace_original_forward"):
       return
+
+    if not hasattr(module, "_workspace_dtype_guard_handle"):
+      def _dtype_guard(mod: torch.nn.Module, args, kwargs):
+        hidden_states = None
+        use_kwargs = False
+        if kwargs and "hidden_states" in kwargs:
+          hidden_states = kwargs["hidden_states"]
+          use_kwargs = True
+        elif args:
+          hidden_states = args[0]
+        if not isinstance(hidden_states, torch.Tensor) or not hidden_states.is_floating_point():
+          return args, kwargs
+        target = getattr(mod, "q_proj", None)
+        target_dtype = getattr(target, "weight", None).dtype if target is not None and hasattr(target, "weight") else None
+        if target_dtype is None or hidden_states.dtype == target_dtype:
+          return args, kwargs
+        cast_hidden = hidden_states.to(dtype=target_dtype)
+        if use_kwargs:
+          kwargs = dict(kwargs)
+          kwargs["hidden_states"] = cast_hidden
+        else:
+          args = (cast_hidden,) + args[1:]
+        return args, kwargs
+
+      guard_handle = module.register_forward_pre_hook(_dtype_guard, with_kwargs=True)
+      module._workspace_dtype_guard_handle = guard_handle
+
     original_forward = module.forward
     signature = inspect.signature(original_forward)
     accepts_attention_mask = "attention_mask" in signature.parameters
     accepts_past_values = "past_key_values" in signature.parameters
     accepts_past_value = "past_key_value" in signature.parameters
 
+    def _cast_to_dtype(obj, dtype):
+      if dtype is None:
+        return obj
+      if torch.is_tensor(obj) and obj.is_floating_point() and obj.dtype != dtype:
+        return obj.to(dtype=dtype)
+      if HFModelOutput is not None and isinstance(obj, HFModelOutput):
+        return obj.to(dtype=dtype)
+      if isinstance(obj, tuple) and obj:
+        head = _cast_to_dtype(obj[0], dtype)
+        return (head,) + obj[1:]
+      return obj
+
     def patched_forward(*args, **kwargs):
       runtime: WorkspaceRuntimeState = RuntimeVar.get()
-      if runtime is None:
-        return original_forward(*args, **kwargs)
+      runtime_dtype = getattr(runtime, "model_dtype", None) if runtime is not None else None
+      target_attn_dtype = None
+      if hasattr(module, "q_proj") and hasattr(module.q_proj, "weight"):
+        target_attn_dtype = module.q_proj.weight.dtype
+      if target_attn_dtype is not None:
+        if args and isinstance(args[0], torch.Tensor) and args[0].is_floating_point() and args[0].dtype != target_attn_dtype:
+          first = args[0].to(dtype=target_attn_dtype)
+          args = (first, *args[1:])
+        if "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+          hidden_states_kw = kwargs["hidden_states"]
+          if hidden_states_kw.is_floating_point() and hidden_states_kw.dtype != target_attn_dtype:
+            kwargs["hidden_states"] = hidden_states_kw.to(dtype=target_attn_dtype)
       if not getattr(patched_forward, "_logged_input_once", False):
         first_arg = args[0] if args else kwargs.get("hidden_states")
         dtype = first_arg.dtype if isinstance(first_arg, torch.Tensor) else None
         print(f"[attention-patch] layer={self.layer_idx} input_dtype={dtype}", flush=True)
         patched_forward._logged_input_once = True
+
+      if runtime is None:
+        return original_forward(*args, **kwargs)
+
       bound = signature.bind_partial(*args, **kwargs)
       toggles = runtime.toggles
       past_arg_name: Optional[str] = None
@@ -181,15 +237,13 @@ class AttentionPatcher:
               past_dtype = past[0].dtype
             print(f"[workspace-debug] layer={self.layer_idx} hidden_states={hs_dtype} past={past_dtype} virtual={virtual_k.dtype}", flush=True)
             AttentionPatcher._logged_dtype_once = True
-          expected_dtype = None
-          if args and isinstance(args[0], torch.Tensor):
+          expected_dtype = runtime_dtype
+          if expected_dtype is None and args and isinstance(args[0], torch.Tensor):
             expected_dtype = args[0].dtype
           if expected_dtype is None:
             hidden_states_arg = bound.arguments.get("hidden_states")
             if isinstance(hidden_states_arg, torch.Tensor):
               expected_dtype = hidden_states_arg.dtype
-          if expected_dtype is None:
-            expected_dtype = getattr(runtime, "model_dtype", None)
           if expected_dtype is not None:
             if virtual_k.dtype != expected_dtype:
               virtual_k = virtual_k.to(dtype=expected_dtype)
@@ -218,11 +272,17 @@ class AttentionPatcher:
       outputs = original_forward(*bound.args, **bound.kwargs)
       model_output = HFModelOutput is not None and isinstance(outputs, HFModelOutput)
       if not model_output and not isinstance(outputs, tuple):
+        if target_attn_dtype is not None and isinstance(outputs, torch.Tensor) and outputs.is_floating_point() and outputs.dtype != target_attn_dtype:
+          return outputs.to(dtype=target_attn_dtype)
         return outputs
       hidden_states = outputs[0]
+      if target_attn_dtype is not None and isinstance(hidden_states, torch.Tensor) and hidden_states.is_floating_point() and hidden_states.dtype != target_attn_dtype:
+        hidden_states = hidden_states.to(dtype=target_attn_dtype)
       if runtime.record_residual:
         runtime.record_residual(self.layer_idx, hidden_states.detach())
       final_hidden = hidden_states
+      if target_attn_dtype is not None and isinstance(final_hidden, torch.Tensor) and final_hidden.is_floating_point() and final_hidden.dtype != target_attn_dtype:
+        final_hidden = final_hidden.to(dtype=target_attn_dtype)
       if toggles.residual_delta and runtime.residual_delta:
         final_hidden = runtime.residual_delta(self.layer_idx, hidden_states)
       if isinstance(final_hidden, torch.Tensor) and isinstance(hidden_states, torch.Tensor) and final_hidden.dtype != hidden_states.dtype:
@@ -240,6 +300,8 @@ class AttentionPatcher:
       else:
         if final_hidden is not hidden_states:
           outputs = (final_hidden,) + outputs[1:]
+        elif target_attn_dtype is not None and isinstance(outputs[0], torch.Tensor) and outputs[0].is_floating_point() and outputs[0].dtype != target_attn_dtype:
+          outputs = (outputs[0].to(dtype=target_attn_dtype),) + outputs[1:]
       if runtime.post_attention_hook:
         runtime.post_attention_hook(self.layer_idx, final_hidden.detach())
       if not getattr(patched_forward, "_logged_dtype_once", False):

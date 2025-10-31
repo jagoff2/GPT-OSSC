@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+import threading
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -93,8 +94,10 @@ class WorkspaceMemory:
     self.faiss_path = Path(config.faiss_index_path)
     self.embedding_dim = config.memory_embedding_dim
     self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-    self.conn = sqlite3.connect(self.sqlite_path)
-    self._init_db()
+    self._lock = threading.RLock()
+    self.conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
+    with self._lock:
+      self._init_db()
     if faiss is not None:
       self.index = faiss.IndexFlatIP(self.embedding_dim)
       if self.faiss_path.exists():
@@ -128,55 +131,62 @@ class WorkspaceMemory:
     self.conn.commit()
 
   def add(self, entry: MemoryEntry) -> None:
-    cur = self.conn.cursor()
-    cur.execute(
-      "INSERT INTO memory (time, goal, decision, outcome, ws_snapshot, tags, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      (
-        entry.time,
-        entry.goal,
-        entry.decision,
-        entry.outcome,
-        json.dumps(entry.ws_snapshot),
-        json.dumps(entry.tags),
-        entry.text,
-      ),
-    )
-    self.conn.commit()
-    embedding = self.encoder.encode(entry.text, convert_to_numpy=True)
-    if not self.index.is_trained:
-      self.index.train(np.expand_dims(embedding, axis=0))
-    self.index.add(np.expand_dims(embedding, axis=0))
-    self._persist_index()
+    with self._lock:
+      cur = self.conn.cursor()
+      cur.execute(
+        "INSERT INTO memory (time, goal, decision, outcome, ws_snapshot, tags, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+          entry.time,
+          entry.goal,
+          entry.decision,
+          entry.outcome,
+          json.dumps(entry.ws_snapshot),
+          json.dumps(entry.tags),
+          entry.text,
+        ),
+      )
+      self.conn.commit()
+      embedding = self.encoder.encode(entry.text, convert_to_numpy=True)
+      if not self.index.is_trained:
+        self.index.train(np.expand_dims(embedding, axis=0))
+      self.index.add(np.expand_dims(embedding, axis=0))
+      self._persist_index_locked()
 
   def search(self, query: str, k: int = 5) -> List[Tuple[float, MemoryEntry]]:
-    if self.index.ntotal == 0:
-      return []
-    embedding = self.encoder.encode(query, convert_to_numpy=True)
-    scores, ids = self.index.search(np.expand_dims(embedding, axis=0), k)
-    cur = self.conn.cursor()
-    results: List[Tuple[float, MemoryEntry]] = []
-    for score, idx in zip(scores[0], ids[0]):
-      if idx < 0:
-        continue
-      cur.execute("SELECT time, goal, decision, outcome, ws_snapshot, tags, text FROM memory WHERE id=?", (int(idx) + 1,))
-      row = cur.fetchone()
-      if row:
-        results.append((float(score), MemoryEntry(
-          time=row[0],
-          goal=row[1],
-          decision=row[2],
-          outcome=row[3],
-          ws_snapshot=json.loads(row[4]),
-          tags=json.loads(row[5]),
-          text=row[6]
-        )))
-    return results
+    with self._lock:
+      if self.index.ntotal == 0:
+        return []
+      embedding = self.encoder.encode(query, convert_to_numpy=True)
+      scores, ids = self.index.search(np.expand_dims(embedding, axis=0), k)
+      cur = self.conn.cursor()
+      results: List[Tuple[float, MemoryEntry]] = []
+      for score, idx in zip(scores[0], ids[0]):
+        if idx < 0:
+          continue
+        cur.execute("SELECT time, goal, decision, outcome, ws_snapshot, tags, text FROM memory WHERE id=?", (int(idx) + 1,))
+        row = cur.fetchone()
+        if row:
+          results.append((float(score), MemoryEntry(
+            time=row[0],
+            goal=row[1],
+            decision=row[2],
+            outcome=row[3],
+            ws_snapshot=json.loads(row[4]),
+            tags=json.loads(row[5]),
+            text=row[6]
+          )))
+      return results
 
   def close(self) -> None:
-    self.conn.close()
+    with self._lock:
+      self.conn.close()
 
-  def _persist_index(self) -> None:
+  def _persist_index_locked(self) -> None:
     if faiss is not None:
       faiss.write_index(self.index, str(self.faiss_path))
     else:
       self.index.save()
+
+  def _persist_index(self) -> None:
+    with self._lock:
+      self._persist_index_locked()

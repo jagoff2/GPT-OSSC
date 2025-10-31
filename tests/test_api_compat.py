@@ -5,6 +5,7 @@ import torch
 from fastapi.testclient import TestClient
 
 from gpt_oss_ws.api_server import create_app
+from gpt_oss_ws.model_wrapper import HarmonyParseResult
 
 
 class _Tokenizer:
@@ -22,6 +23,18 @@ class FakeModel:
 
   def tokenizer_decode(self, tokens: torch.Tensor) -> str:
     return "stub-response"
+
+  def prepare_chat_inputs(self, messages, add_generation_prompt=True, tools=None):
+    length = 3
+    return torch.tensor([[1, 2, 3]]), torch.ones((1, length), dtype=torch.long)
+
+  def _parse_harmony_tokens(self, token_ids):
+    generated = "stub-response"[: len(token_ids)]
+    complete = len(generated) == len("stub-response")
+    return HarmonyParseResult("", complete, generated, complete)
+
+  def decode_generated(self, tokens: torch.Tensor, prompt_tokens: int) -> HarmonyParseResult:
+    return HarmonyParseResult("", True, "stub-response", True)
 
   def generate(self, request_ctx, **kwargs):
     if "stream_callback" in kwargs and kwargs["stream_callback"] is not None:

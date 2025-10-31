@@ -23,9 +23,9 @@ class WorkspaceConfig:
   quantization: Literal["bnb-4bit", "bf16", "Mxfp4"] = "Mxfp4"
   device_map: Literal["auto", "balanced", "sequential"] = "auto"
   hooked_layers: List[HookLayer] = field(default_factory=lambda: [1, 5, 9, 13, 17, 21])
-  nvirt: int = 4
+  nvirt: int = 2
   residual_rank: int = 8
-  slot_count: int = 6
+  slot_count: int = 4
   slot_dim: int = 256
   slot_iterations: int = 1
   enable_kv_append: bool = True

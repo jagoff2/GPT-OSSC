@@ -21,43 +21,65 @@ class ResidualDeltaHook(nn.Module):
     nn.init.normal_(self.u, mean=0.0, std=0.02)
     nn.init.normal_(self.v, mean=0.0, std=0.02)
 
-  def apply(self, layer_idx: int, residual: torch.Tensor, slots: torch.Tensor, entropy: float, entropy_floor: float) -> torch.Tensor:
+    freq = torch.arange(self.slot_dim, dtype=torch.float32).unsqueeze(1)
+    span = torch.arange(self.hidden_size, dtype=torch.float32).unsqueeze(0) + 1.0
+    action_basis = torch.sin(freq * span * torch.pi / max(self.hidden_size, 1))
+    action_basis = action_basis / action_basis.norm(dim=0, keepdim=True).clamp_min(1e-6)
+    self.register_buffer("action_basis", action_basis)
+
+  def apply(
+    self,
+    layer_idx: int,
+    residual: torch.Tensor,
+    slots: torch.Tensor,
+    entropy: float,
+    entropy_floor: float,
+    plan_energy: torch.Tensor,
+  ) -> torch.Tensor:
     if slots is None or residual.size(1) == 0:
       return residual
     try:
       hooked_idx = self.hooked_layers.index(layer_idx)
     except ValueError:
       return residual
-    gate = torch.sigmoid(self.gate[hooked_idx])
-    if entropy < entropy_floor:
-      gate = gate * 0.1
-    # Work in the same dtype as the residual/hidden states to avoid promoting to float32.
     target_dtype = residual.dtype
     slot_avg = slots.mean(dim=1)
     if slot_avg.dtype != target_dtype:
       slot_avg = slot_avg.to(dtype=target_dtype)
-    # Retrieve parameters for this layer in target dtype
+    plan_energy = plan_energy.to(target_dtype)
+    energy_term = torch.tanh(plan_energy).unsqueeze(-1).to(target_dtype)
+
+    gate_scalar = torch.sigmoid(self.gate[hooked_idx]).to(target_dtype)
+    gate = gate_scalar * (1.0 + energy_term.squeeze(-1))
+    if entropy < entropy_floor:
+      gate = gate * 0.1
+
     v = self.v[hooked_idx]
     u = self.u[hooked_idx]
     if v.dtype != target_dtype:
       v = v.to(dtype=target_dtype)
     if u.dtype != target_dtype:
       u = u.to(dtype=target_dtype)
-    coeff = torch.matmul(slot_avg, v)  # [B, rank]
-    delta = torch.matmul(coeff, u)  # [B, hidden_size]
-    # Ensure dtype compatibility with residual (which may be bfloat16)
+    coeff = torch.matmul(slot_avg, v)
+    delta = torch.matmul(coeff, u)
     if delta.dtype != target_dtype:
       delta = delta.to(dtype=target_dtype)
-    if gate.dtype != target_dtype:
-      gate = gate.to(dtype=target_dtype)
-    if not getattr(self, "_logged_dtype_once", False):
-      print(
-        f"[residual-delta] layer={layer_idx} residual={residual.dtype} slots={slots.dtype} delta={delta.dtype} gate={gate.dtype}",
-        flush=True,
-      )
-      self._logged_dtype_once = True
+
+    action_drive = torch.matmul(slot_avg, self.action_basis)
+    action_drive = torch.tanh(action_drive).to(target_dtype)
+    delta = delta + energy_term * action_drive
+
+    gate = gate.unsqueeze(-1)
     residual[:, -1, :] = residual[:, -1, :] + gate * delta
     return residual
 
-  def forward(self, layer_idx: int, residual: torch.Tensor, slots: torch.Tensor, entropy: float, entropy_floor: float) -> torch.Tensor:
-    return self.apply(layer_idx, residual, slots, entropy, entropy_floor)
+  def forward(
+    self,
+    layer_idx: int,
+    residual: torch.Tensor,
+    slots: torch.Tensor,
+    entropy: float,
+    entropy_floor: float,
+    plan_energy: torch.Tensor,
+  ) -> torch.Tensor:
+    return self.apply(layer_idx, residual, slots, entropy, entropy_floor, plan_energy)

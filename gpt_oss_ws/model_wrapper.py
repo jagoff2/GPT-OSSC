@@ -1,14 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoTokenizer
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 
-from .attention_patch import AttentionPatcher, WorkspaceRuntimeState, workspace_runtime
+from .attention_patch import AttentionPatcher, WorkspaceRuntimeState, workspace_runtime, restore_attention
 from .config import WorkspaceConfig
 from .controller import ControllerOutput, WorkspaceController
 from .kv_projector import VirtualKVProjector
@@ -28,13 +29,21 @@ class WorkspaceSnapshot:
   controller: ControllerOutput
 
 
+@dataclass
+class HarmonyParseResult:
+  analysis: str
+  analysis_complete: bool
+  final: str
+  final_complete: bool
+
+
 class GPTOSSHookedModel:
   def __init__(self, config: WorkspaceConfig) -> None:
     self.config = config
     self.logger = init_logger("gpt_oss_ws", config.log_level)
     self.model = load_quantized_model(config)
     self.model_config = load_model_config(config.model_name)
-    self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
     self.hidden_size = getattr(self.model_config, "hidden_size", None)
     if self.hidden_size is None:
       raise ValueError("Model config missing hidden_size")
@@ -45,16 +54,23 @@ class GPTOSSHookedModel:
       self.model_dtype = next(self.model.parameters()).dtype
     except StopIteration:
       self.model_dtype = torch.float32
+    self.workspace_dtype = self._select_workspace_dtype()
     self._validate_layers()
     self.probes = LayerProbeBank(config, self.hidden_size)
     self.workspace = SlotAttentionWorkspace(config)
-    self.kv_projector = VirtualKVProjector(config, self.hidden_size, self.model_dtype)
+    self.kv_projector = VirtualKVProjector(
+      config,
+      self.hidden_size,
+      self.model_dtype,
+      workspace_dtype=self.workspace_dtype,
+    )
     self.residual_delta = ResidualDeltaHook(config, self.hidden_size)
     self.controller = WorkspaceController(config)
     self.memory = WorkspaceMemory(config)
     self.layer_patchers: Dict[int, AttentionPatcher] = {}
     self._layer_residuals: Dict[int, torch.Tensor] = {}
     self._current_slots: Optional[torch.Tensor] = None
+    self._current_plan_energy: Optional[torch.Tensor] = None
     self._current_entropy: float = 0.0
     self._apply_patches()
     self._attach_moe_dtype_guards()
@@ -82,6 +98,21 @@ class GPTOSSHookedModel:
     if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
       return list(self.model.model.layers)
     raise ValueError("Unsupported model architecture for GPT-OSS workspace hooks")
+
+  def _select_workspace_dtype(self) -> torch.dtype:
+    preferred = torch.bfloat16
+    device = None
+    try:
+      device = self.primary_device()
+      torch.zeros(1, device=device, dtype=preferred)
+    except Exception:
+      self.logger.warning(
+        "Workspace dtype bfloat16 unsupported on device %s; falling back to %s.",
+        device if device is not None else "unknown",
+        self.model_dtype,
+      )
+      return self.model_dtype
+    return preferred
 
   def _attach_moe_dtype_guards(self) -> None:
     for module in self.model.modules():
@@ -132,7 +163,19 @@ class GPTOSSHookedModel:
     self._layer_residuals[layer_idx] = tensor
 
   def _residual_delta(self, layer_idx: int, residual: torch.Tensor) -> torch.Tensor:
-    return self.residual_delta.apply(layer_idx, residual, self._current_slots, self._current_entropy, self.config.controller_entropy_floor)
+    plan_energy = self._current_plan_energy
+    if plan_energy is None or not isinstance(plan_energy, torch.Tensor):
+      plan_energy = torch.zeros(residual.size(0), device=residual.device, dtype=residual.dtype)
+    else:
+      plan_energy = plan_energy.to(device=residual.device, dtype=residual.dtype)
+    return self.residual_delta.apply(
+      layer_idx,
+      residual,
+      self._current_slots,
+      self._current_entropy,
+      self.config.controller_entropy_floor,
+      plan_energy,
+    )
 
   def _apply_feature_flags(self, toggles: HookToggles) -> HookToggles:
     return HookToggles(
@@ -153,6 +196,7 @@ class GPTOSSHookedModel:
       device=str(self.primary_device()),
       slots=self._current_slots,
       entropy=self._current_entropy,
+      model_dtype=self.workspace_dtype,
     )
 
   def _kv_fetch(self, layer_idx: int, device: str) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
@@ -160,15 +204,18 @@ class GPTOSSHookedModel:
 
   def _prepare_slots(self, toggles: HookToggles) -> Optional[torch.Tensor]:
     if not toggles.read_probes or not self._layer_residuals:
+      self._current_plan_energy = None
       return None
     layer_residuals = {layer: tensor for layer, tensor in self._layer_residuals.items() if layer in self.config.hooked_layers}
     if not layer_residuals:
+      self._current_plan_energy = None
       return None
     features = self.probes(layer_residuals)
     device = self.workspace.slot_mu.device
     features = features.to(device=device, dtype=self.workspace.slot_mu.dtype)
-    slots = self.workspace(features)
+    slots, plan_energy = self.workspace(features)
     self._current_slots = slots
+    self._current_plan_energy = plan_energy.to(device=slots.device, dtype=slots.dtype)
     return slots
 
   def _controller_step(self, slots: Optional[torch.Tensor], logits: torch.Tensor) -> ControllerOutput:
@@ -194,7 +241,12 @@ class GPTOSSHookedModel:
     return self.tokenizer(text, return_tensors="pt", **kwargs)["input_ids"]
 
   def tokenizer_decode(self, tokens: torch.Tensor) -> str:
-    return self.tokenizer.decode(tokens, skip_special_tokens=True)
+    if tokens.numel() == 0:
+      return ""
+    parsed = self._parse_harmony_tokens(tokens.tolist())
+    if parsed.final:
+      return parsed.final.strip()
+    return self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
 
   def workspace_step(self, toggles: HookToggles, logits: torch.Tensor) -> ControllerOutput:
     effective = self._apply_feature_flags(toggles)
@@ -205,8 +257,11 @@ class GPTOSSHookedModel:
       device = str(self.primary_device())
       for layer_idx in self.config.hooked_layers:
         residual = self._layer_residuals.get(layer_idx)
-        target_dtype = residual.dtype if residual is not None else self.model_dtype
-        self.kv_projector(slots, layer_idx, device, target_dtype)
+        target_dtype = self.workspace_dtype
+        plan_energy = self._current_plan_energy
+        if plan_energy is None:
+          plan_energy = torch.zeros(slots.size(0), device=slots.device, dtype=slots.dtype)
+        self.kv_projector(slots, layer_idx, device, target_dtype, plan_energy=plan_energy)
     if decision.write_memory and slots is not None:
       snapshot = slots.detach().cpu().reshape(-1).tolist()
       entry = MemoryEntry(
@@ -224,7 +279,90 @@ class GPTOSSHookedModel:
     return decision
 
   def runtime_context(self, toggles: HookToggles):
+    if not (toggles.kv_append or toggles.residual_delta or toggles.read_probes or toggles.broadcast):
+      return contextlib.nullcontext()
     return workspace_runtime(self._runtime_state(toggles))
+
+  @contextlib.contextmanager
+  def baseline_mode(self):
+    decoder_layers = self._decoder_layers()
+    restored = []
+    for layer_idx in self.config.hooked_layers:
+      module = decoder_layers[layer_idx].self_attn
+      if hasattr(module, "_workspace_original_forward"):
+        restore_attention(module)
+        restored.append((layer_idx, module))
+    try:
+      yield
+    finally:
+      for layer_idx, module in restored:
+        patcher = self.layer_patchers[layer_idx]
+        patcher.patch(module)
 
   def close(self) -> None:
     self.memory.close()
+
+  def prepare_chat_inputs(
+    self,
+    messages: Sequence[Dict[str, str]],
+    tools: Optional[Sequence[Dict[str, object]]] = None,
+    add_generation_prompt: bool = True,
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    chat = self.tokenizer.apply_chat_template(
+      messages,
+      tools=tools,
+      tokenize=True,
+      add_generation_prompt=add_generation_prompt,
+      return_tensors="pt",
+    )
+    if hasattr(chat, "keys"):
+      input_ids = chat["input_ids"]
+      attention_mask = chat.get("attention_mask")
+      if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+      return input_ids, attention_mask
+    if isinstance(chat, torch.Tensor):
+      token_tensor = chat
+    else:
+      token_tensor = torch.tensor(chat, dtype=torch.long)
+    if token_tensor.dim() == 1:
+      token_tensor = token_tensor.unsqueeze(0)
+    attention_mask = torch.ones_like(token_tensor, dtype=torch.long)
+    return token_tensor, attention_mask
+
+  def decode_generated(self, full_tokens: torch.Tensor, prompt_tokens: int) -> HarmonyParseResult:
+    parse_full = self._parse_harmony_tokens(full_tokens.tolist())
+    if parse_full.final:
+      return parse_full
+    generated = full_tokens[prompt_tokens:]
+    return self._parse_harmony_tokens(generated.tolist())
+
+  def _parse_harmony_tokens(self, token_ids: Sequence[int]) -> HarmonyParseResult:
+    if not token_ids:
+      return HarmonyParseResult("", False, "", False)
+    text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+    analysis, analysis_complete = self._extract_channel_text(text, "analysis")
+    final, final_complete = self._extract_channel_text(text, "final")
+    if analysis:
+      analysis = self._clean_channel_text(analysis)
+    if final:
+      final = self._clean_channel_text(final)
+    return HarmonyParseResult(analysis, analysis_complete, final, final_complete)
+
+  @staticmethod
+  def _extract_channel_text(text: str, channel: str) -> Tuple[str, bool]:
+    marker = f"<|start|>assistant<|channel|>{channel}<|message|>"
+    end_token = "<|end|>"
+    start = text.rfind(marker)
+    if start == -1:
+      return "", False
+    start += len(marker)
+    end = text.find(end_token, start)
+    if end == -1:
+      return text[start:], False
+    return text[start:end], True
+
+  @staticmethod
+  def _clean_channel_text(text: str) -> str:
+    cleaned = text.replace("<|return|>", "")
+    return cleaned.strip()

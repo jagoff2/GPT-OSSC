@@ -24,7 +24,14 @@ def _resolve_config(path: Optional[Path]) -> Path:
 
 
 @app.command()
-def serve(config: Optional[Path] = typer.Option(None, "--config", help="Path to server YAML config"), host: Optional[str] = typer.Option(None, "--host"), port: Optional[int] = typer.Option(None, "--port")) -> None:
+def serve(
+  config: Optional[Path] = typer.Option(None, "--config", help="Path to server YAML config"),
+  host: Optional[str] = typer.Option(None, "--host"),
+  port: Optional[int] = typer.Option(None, "--port"),
+  seed: int = typer.Option(99, "--seed", help="Base seed for deterministic generation"),
+  temperature: float = typer.Option(0.0, "--temperature", help="Default sampling temperature"),
+  top_p: float = typer.Option(1.0, "--top-p", help="Default nucleus sampling top-p (1.0 disables filtering)"),
+) -> None:
   cfg_path = _resolve_config(config)
   cfg = load_config(str(cfg_path))
   if host:
@@ -34,7 +41,12 @@ def serve(config: Optional[Path] = typer.Option(None, "--config", help="Path to 
   logger = init_logger("cli.serve", cfg.log_level)
   logger.info("Starting API server", extra={"host": cfg.api_host, "port": cfg.api_port})
   uvicorn.run(
-    create_app(str(cfg_path)),
+    create_app(
+      str(cfg_path),
+      base_seed=seed,
+      default_temperature=temperature,
+      default_top_p=top_p,
+    ),
     host=cfg.api_host,
     port=cfg.api_port,
     log_level=cfg.log_level.lower(),

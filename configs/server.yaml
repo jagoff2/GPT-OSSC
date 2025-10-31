@@ -2,6 +2,7 @@
 model_name: openai/gpt-oss-20b
 quantization: fp32
 device_map: auto
+#hooked_layers: [1, 5, 9, 13, 17, 21]
 hooked_layers: [1, 5, 9, 13, 17, 21]
 api_host: 0.0.0.0
 api_port: 8000
