@@ -151,7 +151,11 @@ class AttentionPatcher:
         if not isinstance(hidden_states, torch.Tensor) or not hidden_states.is_floating_point():
           return args, kwargs
         target = getattr(mod, "q_proj", None)
-        target_dtype = getattr(target, "weight", None).dtype if target is not None and hasattr(target, "weight") else None
+        target_dtype = None
+        if target is not None:
+          target_dtype = getattr(target, "weight_dtype", None)
+          if target_dtype is None and hasattr(target, "weight"):
+            target_dtype = target.weight.dtype  # type: ignore[union-attr]
         if target_dtype is None or hidden_states.dtype == target_dtype:
           return args, kwargs
         cast_hidden = hidden_states.to(dtype=target_dtype)
@@ -187,8 +191,11 @@ class AttentionPatcher:
       runtime: WorkspaceRuntimeState = RuntimeVar.get()
       runtime_dtype = getattr(runtime, "model_dtype", None) if runtime is not None else None
       target_attn_dtype = None
-      if hasattr(module, "q_proj") and hasattr(module.q_proj, "weight"):
-        target_attn_dtype = module.q_proj.weight.dtype
+      if hasattr(module, "q_proj"):
+        q_proj = module.q_proj
+        target_attn_dtype = getattr(q_proj, "weight_dtype", None)
+        if target_attn_dtype is None and hasattr(q_proj, "weight"):
+          target_attn_dtype = q_proj.weight.dtype  # type: ignore[union-attr]
       if target_attn_dtype is not None:
         if args and isinstance(args[0], torch.Tensor) and args[0].is_floating_point() and args[0].dtype != target_attn_dtype:
           first = args[0].to(dtype=target_attn_dtype)

@@ -11,8 +11,8 @@ HookLayer = Literal[1, 5, 9, 13, 17, 21]
 
 @dataclass
 class RetentionConfig:
-  virt_kv_max_tokens_per_layer: int = 1024
-  virt_kv_ttl_steps: int = 2048
+  virt_kv_max_tokens_per_layer: int = 512
+  virt_kv_ttl_steps: int = 1024
   spill_to_cpu: bool = True
   prefetch_margin: int = 16
 
@@ -26,7 +26,7 @@ class WorkspaceConfig:
   nvirt: int = 2
   residual_rank: int = 8
   slot_count: int = 4
-  slot_dim: int = 256
+  slot_dim: int = 128
   slot_iterations: int = 1
   enable_kv_append: bool = True
   enable_residual_delta: bool = True

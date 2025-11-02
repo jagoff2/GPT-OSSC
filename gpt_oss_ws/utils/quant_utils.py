@@ -1,18 +1,32 @@
 from __future__ import annotations
 
+import platform
 from typing import Any, Dict
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from ..config import WorkspaceConfig
+from ..quantization import quantize_linear_module
 
 import torch
+from torch import nn
+
+
+def _apply_int8_static_quant(model: nn.Module, target_dtype: torch.dtype) -> None:
+    for name, module in model.named_children():
+        if isinstance(module, nn.Linear):
+            quantized = quantize_linear_module(module, target_dtype)
+            setattr(model, name, quantized)
+        else:
+            _apply_int8_static_quant(module, target_dtype)
 
 
 def load_quantized_model(config: WorkspaceConfig) -> AutoModelForCausalLM:
     torch_dtype = None
     load_in_4bit = False
     quantization_config: Dict[str, Any] = {}
+    int8_static = False
+    force_cpu_device_map = False
     if config.quantization == "Mxfp4":
         torch_dtype = torch.float32
         # MXFP4 quantization is not supported on this runtime; fall back to float32 for compatibility
@@ -32,15 +46,51 @@ def load_quantized_model(config: WorkspaceConfig) -> AutoModelForCausalLM:
         load_in_4bit = True
     elif config.quantization == "bf16":
         torch_dtype = torch.bfloat16
+    elif config.quantization == "int8":
+        cuda_available = torch.cuda.is_available() and torch.cuda.device_count() > 0
+        windows_runtime = platform.system().lower().startswith("windows")
+        if not cuda_available or windows_runtime or config.device_map == "cpu":
+            print(
+                "Static int8 quantization requires CUDA kernels; falling back to bf16 for this runtime.",
+                flush=True,
+            )
+            torch_dtype = torch.bfloat16 if config.bf16_fallback else torch.float32
+            int8_static = False
+            config.quantization = "bf16"
+            force_cpu_device_map = True
+        else:
+            torch_dtype = torch.float32
+            int8_static = True
+    device_map_arg = None
+    if config.device_map == "auto":
+        if torch.cuda.device_count() > 0:
+            device_map_arg = "auto"
+    else:
+        device_map_arg = config.device_map
+    if force_cpu_device_map:
+        device_map_arg = "cpu"
+
+    cpu_runtime = (device_map_arg == "cpu") or not torch.cuda.is_available()
+    if cpu_runtime:
+        if torch_dtype is None or torch_dtype == torch.bfloat16:
+            torch_dtype = torch.float32
+        config.bf16_fallback = False
+
+    low_cpu = not int8_static
+
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        device_map=config.device_map if config.device_map != "auto" else None,
+        device_map=device_map_arg,
         torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
+        low_cpu_mem_usage=low_cpu,
         **quantization_config,
     )
     if load_in_4bit and hasattr(model, "config"):
         model.config.torch_dtype = None
+    if int8_static:
+        target_dtype = torch.bfloat16 if config.bf16_fallback else torch.float16
+        _apply_int8_static_quant(model, target_dtype)
+        model.to(dtype=target_dtype)
     return model
 
 

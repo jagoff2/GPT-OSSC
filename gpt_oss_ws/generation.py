@@ -5,6 +5,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from transformers.cache_utils import Cache, DynamicCache
+from contextlib import nullcontext
 
 from .model_wrapper import GPTOSSHookedModel
 from .types import GenerationRequestContext
@@ -74,14 +75,21 @@ def generate_with_workspace(
         if not isinstance(cache, Cache):
             cache = DynamicCache.from_legacy_cache(cache)
     
+    autocast_context = nullcontext()
+    if device.type in {"cpu", "cuda"}:
+      try:
+        autocast_context = torch.autocast(device.type, dtype=model.model_dtype)
+      except Exception:
+        autocast_context = nullcontext()
     with model.runtime_context(request.toggles):
-      outputs = model.model(
-        input_ids=step_input,
-        attention_mask=attention_mask,
-        past_key_values=cache,
-        cache_position=cache_position,
-        use_cache=True,
-      )
+      with autocast_context:
+        outputs = model.model(
+          input_ids=step_input,
+          attention_mask=attention_mask,
+          past_key_values=cache,
+          cache_position=cache_position,
+          use_cache=True,
+        )
     logits = outputs.logits[:, -1, :]
     new_cache = getattr(outputs, "past_key_values", outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None)
     if isinstance(new_cache, tuple):

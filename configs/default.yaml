@@ -1,5 +1,5 @@
-﻿model_name: openai/gpt-oss-20b
-quantization: Mxfp4
+model_name: openai/gpt-oss-20b
+quantization: int8
 device_map: auto
 hooked_layers: [1, 5, 9, 13, 17, 21]
 nvirt: 4

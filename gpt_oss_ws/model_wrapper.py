@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -73,7 +74,8 @@ class GPTOSSHookedModel:
     self._current_plan_energy: Optional[torch.Tensor] = None
     self._current_entropy: float = 0.0
     self._apply_patches()
-    self._attach_moe_dtype_guards()
+    self.model_dtype = self._attach_moe_dtype_guards()
+    self._log_param_footprint()
     self.logger.info("GPT-OSS workspace model initialized")
 
   def primary_device(self) -> torch.device:
@@ -100,6 +102,8 @@ class GPTOSSHookedModel:
     raise ValueError("Unsupported model architecture for GPT-OSS workspace hooks")
 
   def _select_workspace_dtype(self) -> torch.dtype:
+    if not self.config.bf16_fallback:
+      return self.model_dtype
     preferred = torch.bfloat16
     device = None
     try:
@@ -114,18 +118,23 @@ class GPTOSSHookedModel:
       return self.model_dtype
     return preferred
 
-  def _attach_moe_dtype_guards(self) -> None:
+  def _attach_moe_dtype_guards(self) -> torch.dtype:
+    desired_dtype = self.workspace_dtype if self.config.bf16_fallback else self.model_dtype
+    if desired_dtype is None:
+      desired_dtype = self.model_dtype or torch.float32
     for module in self.model.modules():
       if isinstance(module, GptOssExperts):
         if hasattr(module, "_workspace_original_experts_forward"):
           continue
 
-        param_device = module.gate_up_proj.device
-        if param_device.type == "cpu" and module.gate_up_proj.dtype != torch.float32:
-          module.gate_up_proj = torch.nn.Parameter(module.gate_up_proj.to(dtype=torch.float32))
-          module.gate_up_proj_bias = torch.nn.Parameter(module.gate_up_proj_bias.to(dtype=torch.float32))
-          module.down_proj = torch.nn.Parameter(module.down_proj.to(dtype=torch.float32))
-          module.down_proj_bias = torch.nn.Parameter(module.down_proj_bias.to(dtype=torch.float32))
+        if module.gate_up_proj.dtype != desired_dtype:
+          module.gate_up_proj.data = module.gate_up_proj.data.to(dtype=desired_dtype)
+        if module.gate_up_proj_bias.dtype != desired_dtype:
+          module.gate_up_proj_bias.data = module.gate_up_proj_bias.data.to(dtype=desired_dtype)
+        if module.down_proj.dtype != desired_dtype:
+          module.down_proj.data = module.down_proj.data.to(dtype=desired_dtype)
+        if module.down_proj_bias.dtype != desired_dtype:
+          module.down_proj_bias.data = module.down_proj_bias.data.to(dtype=desired_dtype)
 
         original_forward = module.forward
 
@@ -158,6 +167,29 @@ class GPTOSSHookedModel:
 
         module._workspace_original_experts_forward = original_forward
         module.forward = patched_forward  # type: ignore[assignment]
+    return desired_dtype
+
+  def _log_param_footprint(self) -> None:
+    try:
+      totals = defaultdict(int)
+      experts_total = 0
+      for name, param in self.model.named_parameters():
+        size_bytes = param.numel() * param.element_size()
+        totals[str(param.dtype)] += size_bytes
+        if "experts" in name:
+          experts_total += size_bytes
+      overall = sum(totals.values())
+      human_totals = ", ".join(
+        f"{dtype}={bytes_val / (1024 ** 3):.1f} GB" for dtype, bytes_val in sorted(totals.items())
+      )
+      self.logger.info(
+        "Parameter footprint: total %.1f GB (%s); experts account for %.1f GB",
+        overall / (1024 ** 3),
+        human_totals,
+        experts_total / (1024 ** 3),
+      )
+    except Exception:
+      self.logger.debug("Failed to log parameter footprint", exc_info=True)
 
   def _record_residual(self, layer_idx: int, tensor: torch.Tensor) -> None:
     self._layer_residuals[layer_idx] = tensor

@@ -1,6 +1,6 @@
 # Server configuration extends default values
 model_name: openai/gpt-oss-20b
-quantization: fp32
+quantization: int8
 device_map: auto
 #hooked_layers: [1, 5, 9, 13, 17, 21]
 hooked_layers: [1, 5, 9, 13, 17, 21]

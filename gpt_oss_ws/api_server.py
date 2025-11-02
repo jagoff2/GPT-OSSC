@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from .config import WorkspaceConfig, load_config
 from .logging_utils import init_logger
 from .model_wrapper import GPTOSSHookedModel
+from .runtime import effective_max_new_tokens
 from .types import GenerationRequestContext, HookToggles
 
 
@@ -151,16 +152,6 @@ def _normalize_prompt(prompt: Union[str, List[str]]) -> str:
   return "\n".join(prompt)
 
 
-def _toggles_from_extra(extra: Dict[str, Any]) -> HookToggles:
-  toggles_cfg = extra.get("toggles", {}) if extra else {}
-  return HookToggles(
-    kv_append=toggles_cfg.get("kv_append", True),
-    residual_delta=toggles_cfg.get("residual_delta", True),
-    read_probes=toggles_cfg.get("read_probes", True),
-    broadcast=toggles_cfg.get("broadcast", True),
-  )
-
-
 def _decode_increment(tokenizer, token_id: int) -> str:
   text = tokenizer.decode([token_id], skip_special_tokens=True)
   if text == "":
@@ -179,6 +170,7 @@ async def _stream_chat_events(
   input_ids: torch.Tensor,
   attention_mask: torch.Tensor,
   prompt_tokens: int,
+  max_new_tokens: int,
   seed: int,
   temperature: float,
   top_p: float,
@@ -204,7 +196,7 @@ async def _stream_chat_events(
         request_ctx,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_new_tokens=payload.max_tokens,
+        max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
         stream_callback=callback,
@@ -293,6 +285,7 @@ async def _stream_completion_events(
   input_ids: torch.Tensor,
   attention_mask: torch.Tensor,
   prompt_tokens: int,
+  max_new_tokens: int,
   seed: int,
   temperature: float,
   top_p: float,
@@ -317,7 +310,7 @@ async def _stream_completion_events(
         request_ctx,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_new_tokens=payload.max_tokens,
+        max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
         stream_callback=callback,
@@ -442,7 +435,8 @@ def create_app(
     message_dicts = _messages_to_dicts(payload.messages)
     input_ids, attention_mask = state.model.prepare_chat_inputs(message_dicts, add_generation_prompt=True)
     prompt_tokens = input_ids.shape[-1]
-    toggles = _toggles_from_extra(payload.extra)
+    max_new_tokens = effective_max_new_tokens(state.model, payload.max_tokens)
+    toggles = HookToggles(kv_append=True, residual_delta=True, read_probes=True, broadcast=True)
     request_ctx = GenerationRequestContext(
       request_id=str(uuid.uuid4()),
       toggles=toggles,
@@ -460,6 +454,7 @@ def create_app(
         input_ids,
         attention_mask,
         prompt_tokens,
+        max_new_tokens,
         seed_value,
         effective_temperature,
         effective_top_p,
@@ -474,7 +469,7 @@ def create_app(
         request_ctx,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_new_tokens=payload.max_tokens,
+        max_new_tokens=max_new_tokens,
         temperature=effective_temperature,
         top_p=effective_top_p,
       )
@@ -515,7 +510,8 @@ def create_app(
     messages = [{"role": "user", "content": prompt_text}]
     input_ids, attention_mask = state.model.prepare_chat_inputs(messages, add_generation_prompt=True)
     prompt_tokens = input_ids.shape[-1]
-    toggles = _toggles_from_extra(payload.extra)
+    max_new_tokens = effective_max_new_tokens(state.model, payload.max_tokens)
+    toggles = HookToggles(kv_append=True, residual_delta=True, read_probes=True, broadcast=True)
     request_ctx = GenerationRequestContext(
       request_id=str(uuid.uuid4()),
       toggles=toggles,
@@ -533,6 +529,7 @@ def create_app(
         input_ids,
         attention_mask,
         prompt_tokens,
+        max_new_tokens,
         seed_value,
         effective_temperature,
         effective_top_p,
@@ -547,7 +544,7 @@ def create_app(
         request_ctx,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        max_new_tokens=payload.max_tokens,
+        max_new_tokens=max_new_tokens,
         temperature=effective_temperature,
         top_p=effective_top_p,
       )
