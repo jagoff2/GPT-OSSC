@@ -12,5 +12,5 @@ def effective_max_new_tokens(model: GPTOSSHookedModel, requested: int) -> int:
   """
   device = model.primary_device()
   if device.type == "cpu":
-    return min(requested, 256)
+    return min(requested, 4096)
   return requested

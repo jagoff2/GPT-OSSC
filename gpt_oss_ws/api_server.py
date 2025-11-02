@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import random
 import time
 import uuid
 from threading import Lock
-from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import WorkspaceConfig, load_config
@@ -54,7 +53,7 @@ class ChatCompletionResponse(BaseModel):
 
 class CompletionRequest(BaseModel):
   model: str
-  prompt: Union[str, List[str]]
+  prompt: Sequence[str] | str
   max_tokens: int = Field(default=256, alias="max_tokens")
   temperature: float = 0.0
   top_p: float = 1.0
@@ -102,7 +101,11 @@ class ServerState:
     self.default_temperature = default_temperature
     self.default_top_p = default_top_p
     self._seed_lock = Lock()
+    self._history_lock = Lock()
+    self._text_lock = Lock()
     self._request_counter = 0
+    self.chat_history: List[Dict[str, str]] = []
+    self.completion_history: str = ""
     _set_seed(self.base_seed)
     try:
       torch.use_deterministic_algorithms(True)
@@ -128,265 +131,40 @@ class ServerState:
   def apply_seed(self, seed: int) -> None:
     _set_seed(seed)
 
-  def snapshot_workspace(self) -> Dict[str, Any]:
-    return self.model.kv_projector.store.state_dict()
-
-  def restore_workspace(self, state_dict: Dict[str, Any]) -> None:
-    self.model.kv_projector.store.load_state_dict(state_dict)
-
   def reset_runtime(self) -> None:
     self.model._current_plan_energy = None  # type: ignore[attr-defined]
     self.model._current_slots = None  # type: ignore[attr-defined]
     self.model._layer_residuals.clear()  # type: ignore[attr-defined]
 
+  def clear_virtual_kv(self) -> None:
+    store_cls = self.model.kv_projector.store.__class__
+    layer_cnt = len(self.model.kv_projector.layer_ids)
+    self.model.kv_projector.store = store_cls(layer_cnt, self.config.retention)
 
-def _build_prompt(messages: List[ChatMessage]) -> str:
-  lines = [f"{message.role}: {message.content}" for message in messages]
-  lines.append("assistant:")
-  return "\n".join(lines)
+  def reset_chat_history(self) -> None:
+    with self._history_lock:
+      self.chat_history.clear()
+    self.clear_virtual_kv()
+
+  def reset_completion_history(self) -> None:
+    with self._text_lock:
+      self.completion_history = ""
+    self.clear_virtual_kv()
 
 
-def _normalize_prompt(prompt: Union[str, List[str]]) -> str:
+def _normalize_prompt(prompt: Sequence[str] | str) -> str:
   if isinstance(prompt, str):
     return prompt
   return "\n".join(prompt)
 
 
-def _decode_increment(tokenizer, token_id: int) -> str:
-  text = tokenizer.decode([token_id], skip_special_tokens=True)
-  if text == "":
-    text = tokenizer.decode([token_id], skip_special_tokens=False)
-  return text
+def _decode_tokens(state: ServerState, tokens: torch.Tensor, prompt_tokens: int) -> str:
+  parse = state.model.decode_generated(tokens[0], prompt_tokens)
+  text = parse.final.strip()
+  if text:
+    return text
+  return state.model.tokenizer_decode(tokens[0, prompt_tokens:]).strip()
 
-
-def _messages_to_dicts(messages: Sequence[ChatMessage]) -> List[Dict[str, str]]:
-  return [message.model_dump() for message in messages]
-
-
-async def _stream_chat_events(
-  state: ServerState,
-  payload: ChatCompletionRequest,
-  request_ctx: GenerationRequestContext,
-  input_ids: torch.Tensor,
-  attention_mask: torch.Tensor,
-  prompt_tokens: int,
-  max_new_tokens: int,
-  seed: int,
-  temperature: float,
-  top_p: float,
-) -> AsyncGenerator[str, None]:
-  queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
-  loop = asyncio.get_event_loop()
-  generated_ids: List[int] = []
-  last_sent_len = 0
-  role_sent = False
-  prefill_ids = input_ids[0].tolist()
-
-  def callback(token: torch.Tensor, logits: torch.Tensor) -> None:
-    token_id = int(token.squeeze().item())
-    generated_ids.append(token_id)
-    loop.call_soon_threadsafe(queue.put_nowait, ("token", token_id))
-
-  def run_generation() -> None:
-    try:
-      snapshot = state.snapshot_workspace()
-      state.reset_runtime()
-      state.apply_seed(seed)
-      tokens = state.model.generate(
-        request_ctx,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stream_callback=callback,
-      )
-      loop.call_soon_threadsafe(queue.put_nowait, ("final", tokens))
-    except Exception as exc:  # pragma: no cover
-      loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
-    finally:
-      state.restore_workspace(snapshot)
-      state.reset_runtime()
-
-  loop.run_in_executor(None, run_generation)
-
-  tokenizer = state.model.tokenizer
-
-  while True:
-    item_type, payload_obj = await queue.get()
-    if item_type == "token":
-      full_sequence = prefill_ids + generated_ids
-      parse = state.model._parse_harmony_tokens(full_sequence)
-      final_text = parse.final
-      if not final_text:
-        continue
-      delta_text = final_text[last_sent_len:]
-      if not delta_text:
-        continue
-      chunk_delta: Dict[str, Any] = {"content": delta_text}
-      if not role_sent:
-        chunk_delta["role"] = "assistant"
-        role_sent = True
-      chunk = {
-        "id": request_ctx.request_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": payload.model,
-        "choices": [
-          {
-            "index": 0,
-            "delta": chunk_delta,
-            "finish_reason": None,
-          }
-        ],
-      }
-      last_sent_len = len(final_text)
-      yield f"data: {json.dumps(chunk)}\n\n"
-    elif item_type == "final":
-      tokens = payload_obj
-      completion_tokens = tokens.shape[-1] - prompt_tokens
-      parse = state.model.decode_generated(tokens[0], prompt_tokens)
-      output_text = parse.final.strip()
-      if not output_text:
-        output_text = state.model.tokenizer_decode(tokens[0, prompt_tokens:])
-      final_chunk = {
-        "id": request_ctx.request_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": payload.model,
-        "choices": [
-          {
-            "index": 0,
-            "message": {"role": "assistant", "content": output_text},
-            "finish_reason": "stop",
-          }
-        ],
-        "usage": {
-          "prompt_tokens": int(prompt_tokens),
-          "completion_tokens": int(completion_tokens),
-          "total_tokens": int(prompt_tokens + completion_tokens),
-        },
-        "extra": payload.extra or None,
-      }
-      yield f"data: {json.dumps(final_chunk)}\n\n"
-      yield "data: [DONE]\n\n"
-      break
-    elif item_type == "error":
-      error_chunk = {"error": {"message": payload_obj, "type": "server_error"}}
-      yield f"data: {json.dumps(error_chunk)}\n\n"
-      yield "data: [DONE]\n\n"
-      break
-
-
-async def _stream_completion_events(
-  state: ServerState,
-  payload: CompletionRequest,
-  request_ctx: GenerationRequestContext,
-  input_ids: torch.Tensor,
-  attention_mask: torch.Tensor,
-  prompt_tokens: int,
-  max_new_tokens: int,
-  seed: int,
-  temperature: float,
-  top_p: float,
-) -> AsyncGenerator[str, None]:
-  queue: asyncio.Queue[Tuple[str, Any]] = asyncio.Queue()
-  loop = asyncio.get_event_loop()
-  generated_ids: List[int] = []
-  last_sent_len = 0
-  prefill_ids = input_ids[0].tolist()
-
-  def callback(token: torch.Tensor, logits: torch.Tensor) -> None:
-    token_id = int(token.squeeze().item())
-    generated_ids.append(token_id)
-    loop.call_soon_threadsafe(queue.put_nowait, ("token", token_id))
-
-  def run_generation() -> None:
-    try:
-      snapshot = state.snapshot_workspace()
-      state.reset_runtime()
-      state.apply_seed(seed)
-      tokens = state.model.generate(
-        request_ctx,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        stream_callback=callback,
-      )
-      loop.call_soon_threadsafe(queue.put_nowait, ("final", tokens))
-    except Exception as exc:  # pragma: no cover
-      loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
-    finally:
-      state.restore_workspace(snapshot)
-      state.reset_runtime()
-
-  loop.run_in_executor(None, run_generation)
-
-  tokenizer = state.model.tokenizer
-
-  while True:
-    item_type, payload_obj = await queue.get()
-    if item_type == "token":
-      full_sequence = prefill_ids + generated_ids
-      parse = state.model._parse_harmony_tokens(full_sequence)
-      final_text = parse.final
-      if not final_text:
-        continue
-      delta_text = final_text[last_sent_len:]
-      if not delta_text:
-        continue
-      chunk = {
-        "id": request_ctx.request_id,
-        "object": "text_completion.chunk",
-        "created": int(time.time()),
-        "model": payload.model,
-        "choices": [
-          {
-            "index": 0,
-            "delta": {"text": delta_text},
-            "finish_reason": None,
-          }
-        ],
-      }
-      last_sent_len = len(final_text)
-      yield f"data: {json.dumps(chunk)}\n\n"
-    elif item_type == "final":
-      tokens = payload_obj
-      completion_tokens = tokens.shape[-1] - prompt_tokens
-      parse = state.model.decode_generated(tokens[0], prompt_tokens)
-      output_text = parse.final.strip()
-      if not output_text:
-        output_text = state.model.tokenizer_decode(tokens[0, prompt_tokens:])
-      final_chunk = {
-        "id": request_ctx.request_id,
-        "object": "text_completion",
-        "created": int(time.time()),
-        "model": payload.model,
-        "choices": [
-          {
-            "index": 0,
-            "text": output_text,
-            "logprobs": None,
-            "finish_reason": "stop",
-          }
-        ],
-        "usage": {
-          "prompt_tokens": int(prompt_tokens),
-          "completion_tokens": int(completion_tokens),
-          "total_tokens": int(prompt_tokens + completion_tokens),
-        },
-        "extra": payload.extra or None,
-      }
-      yield f"data: {json.dumps(final_chunk)}\n\n"
-      yield "data: [DONE]\n\n"
-      break
-    elif item_type == "error":
-      error_chunk = {"error": {"message": payload_obj, "type": "server_error"}}
-      yield f"data: {json.dumps(error_chunk)}\n\n"
-      yield "data: [DONE]\n\n"
-      break
 
 
 def create_app(
@@ -404,6 +182,7 @@ def create_app(
     default_temperature=default_temperature,
     default_top_p=default_top_p,
   )
+
   app = FastAPI()
 
   @app.on_event("shutdown")
@@ -432,55 +211,101 @@ def create_app(
   async def chat_completions(payload: ChatCompletionRequest):
     if payload.model != config.model_name:
       raise HTTPException(status_code=400, detail="model mismatch")
-    message_dicts = _messages_to_dicts(payload.messages)
-    input_ids, attention_mask = state.model.prepare_chat_inputs(message_dicts, add_generation_prompt=True)
+
+    extra = dict(payload.extra or {})
+    if payload.stream:
+      extra["warning"] = "Streaming is not supported in this build; returning full response."
+    reset = bool(extra.pop("reset_history", False))
+
+    default_system = {
+      "role": "system",
+      "content": (
+        "You are ChatGPT, a helpful assistant. Answer every user question directly. "
+        "When a user asks for a calculation, compute it exactly and return the numeric result."
+      ),
+    }
+
+    if reset:
+      state.reset_chat_history()
+    with state._history_lock:
+      payload_messages = [msg.model_dump() for msg in payload.messages]
+      if payload_messages:
+        if state.chat_history:
+          overlap = 0
+          max_overlap = min(len(state.chat_history), len(payload_messages))
+          for k in range(max_overlap, 0, -1):
+            if state.chat_history[-k:] == payload_messages[:k]:
+              overlap = k
+              break
+          if overlap == len(payload_messages) and len(state.chat_history) >= len(payload_messages):
+            state.chat_history = list(payload_messages)
+          else:
+            state.chat_history.extend(payload_messages[overlap:])
+        else:
+          state.chat_history = list(payload_messages)
+      conversation = list(state.chat_history)
+      if not conversation or conversation[0]["role"] != "system":
+        conversation.insert(0, default_system)
+
+    if not conversation:
+      raise HTTPException(status_code=400, detail="Chat history is empty; provide at least one user message.")
+
+    input_ids, attention_mask = state.model.prepare_chat_inputs(conversation, add_generation_prompt=True)
     prompt_tokens = input_ids.shape[-1]
     max_new_tokens = effective_max_new_tokens(state.model, payload.max_tokens)
     toggles = HookToggles(kv_append=True, residual_delta=True, read_probes=True, broadcast=True)
     request_ctx = GenerationRequestContext(
       request_id=str(uuid.uuid4()),
       toggles=toggles,
-      retention_overrides=payload.extra.get("retention") if payload.extra else None,
     )
-    effective_temperature = payload.temperature if payload.temperature is not None else state.default_temperature
-    effective_top_p = payload.top_p if payload.top_p is not None else state.default_top_p
+    temperature = payload.temperature if payload.temperature is not None else state.default_temperature
+    top_p = payload.top_p if payload.top_p is not None else state.default_top_p
     seed_value = state.next_seed()
 
-    if payload.stream:
-      generator = _stream_chat_events(
-        state,
-        payload,
-        request_ctx,
-        input_ids,
-        attention_mask,
-        prompt_tokens,
-        max_new_tokens,
-        seed_value,
-        effective_temperature,
-        effective_top_p,
-      )
-      return StreamingResponse(generator, media_type="text/event-stream")
+    state.reset_runtime()
+    state.apply_seed(seed_value)
+    tokens = state.model.generate(
+      request_ctx,
+      input_ids=input_ids,
+      attention_mask=attention_mask,
+      max_new_tokens=max_new_tokens,
+      temperature=temperature,
+      top_p=top_p,
+    )
+    state.reset_runtime()
 
-    snapshot = state.snapshot_workspace()
-    try:
-      state.reset_runtime()
-      state.apply_seed(seed_value)
-      tokens = state.model.generate(
-        request_ctx,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        temperature=effective_temperature,
-        top_p=effective_top_p,
-      )
-    finally:
-      state.restore_workspace(snapshot)
-      state.reset_runtime()
+    assistant_text = _decode_tokens(state, tokens, prompt_tokens)
+    last_assistant = None
+    with state._history_lock:
+      for entry in reversed(state.chat_history):
+        if entry["role"] == "assistant":
+          last_assistant = entry["content"]
+          break
+    if last_assistant and assistant_text.strip() == last_assistant.strip():
+      fallback_temperature = max(0.7, temperature if temperature > 0 else 0.7)
+      fallback_top_p = top_p if top_p < 0.95 else 0.95
+      if fallback_temperature != temperature or fallback_top_p != top_p:
+        state.reset_runtime()
+        alt_seed = state.next_seed()
+        state.apply_seed(alt_seed)
+        tokens_alt = state.model.generate(
+          request_ctx,
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          max_new_tokens=max_new_tokens,
+          temperature=fallback_temperature,
+          top_p=fallback_top_p,
+        )
+        state.reset_runtime()
+        alt_text = _decode_tokens(state, tokens_alt, prompt_tokens)
+        if alt_text.strip() != last_assistant.strip():
+          assistant_text = alt_text
+          tokens = tokens_alt
+
+    with state._history_lock:
+      state.chat_history.append({"role": "assistant", "content": assistant_text})
+
     completion_tokens = tokens.shape[-1] - prompt_tokens
-    parse = state.model.decode_generated(tokens[0], prompt_tokens)
-    text = parse.final.strip()
-    if not text:
-      text = state.model.tokenizer_decode(tokens[0, prompt_tokens:])
     response = ChatCompletionResponse(
       id=request_ctx.request_id,
       object="chat.completion",
@@ -489,7 +314,7 @@ def create_app(
       choices=[
         ChatCompletionChoice(
           index=0,
-          message={"role": "assistant", "content": text},
+          message={"role": "assistant", "content": assistant_text},
           finish_reason="stop",
         )
       ],
@@ -498,7 +323,7 @@ def create_app(
         "completion_tokens": int(completion_tokens),
         "total_tokens": int(prompt_tokens + completion_tokens),
       },
-      extra=payload.extra or None,
+      extra=extra or None,
     )
     return JSONResponse(content=json.loads(response.json()))
 
@@ -506,8 +331,20 @@ def create_app(
   async def completions(payload: CompletionRequest):
     if payload.model != config.model_name:
       raise HTTPException(status_code=400, detail="model mismatch")
-    prompt_text = _normalize_prompt(payload.prompt)
-    messages = [{"role": "user", "content": prompt_text}]
+
+    extra = dict(payload.extra or {})
+    if payload.stream:
+      extra["warning"] = "Streaming is not supported in this build; returning full response."
+    reset = bool(extra.pop("reset_history", False))
+
+    if reset:
+      state.reset_completion_history()
+    with state._text_lock:
+      prompt_text = _normalize_prompt(payload.prompt)
+      combined_prompt = state.completion_history + prompt_text
+      state.completion_history = combined_prompt
+
+    messages = [{"role": "user", "content": combined_prompt}]
     input_ids, attention_mask = state.model.prepare_chat_inputs(messages, add_generation_prompt=True)
     prompt_tokens = input_ids.shape[-1]
     max_new_tokens = effective_max_new_tokens(state.model, payload.max_tokens)
@@ -515,61 +352,43 @@ def create_app(
     request_ctx = GenerationRequestContext(
       request_id=str(uuid.uuid4()),
       toggles=toggles,
-      retention_overrides=payload.extra.get("retention") if payload.extra else None,
     )
-    effective_temperature = payload.temperature if payload.temperature is not None else state.default_temperature
-    effective_top_p = payload.top_p if payload.top_p is not None else state.default_top_p
+    temperature = payload.temperature if payload.temperature is not None else state.default_temperature
+    top_p = payload.top_p if payload.top_p is not None else state.default_top_p
     seed_value = state.next_seed()
 
-    if payload.stream:
-      generator = _stream_completion_events(
-        state,
-        payload,
-        request_ctx,
-        input_ids,
-        attention_mask,
-        prompt_tokens,
-        max_new_tokens,
-        seed_value,
-        effective_temperature,
-        effective_top_p,
-      )
-      return StreamingResponse(generator, media_type="text/event-stream")
+    state.reset_runtime()
+    state.apply_seed(seed_value)
+    tokens = state.model.generate(
+      request_ctx,
+      input_ids=input_ids,
+      attention_mask=attention_mask,
+      max_new_tokens=max_new_tokens,
+      temperature=temperature,
+      top_p=top_p,
+    )
+    state.reset_runtime()
 
-    snapshot = state.snapshot_workspace()
-    try:
-      state.reset_runtime()
-      state.apply_seed(seed_value)
-      tokens = state.model.generate(
-        request_ctx,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        temperature=effective_temperature,
-        top_p=effective_top_p,
-      )
-    finally:
-      state.restore_workspace(snapshot)
-      state.reset_runtime()
+    completion_text = _decode_tokens(state, tokens, prompt_tokens)
+
+    with state._text_lock:
+      state.completion_history += completion_text
+
     completion_tokens = tokens.shape[-1] - prompt_tokens
-    parse = state.model.decode_generated(tokens[0], prompt_tokens)
-    text = parse.final.strip()
-    if not text:
-      text = state.model.tokenizer_decode(tokens[0, prompt_tokens:])
     response = CompletionResponse(
       id=request_ctx.request_id,
       object="text_completion",
       created=int(time.time()),
       model=payload.model,
       choices=[
-        CompletionChoice(index=0, text=text, finish_reason="stop")
+        CompletionChoice(index=0, text=completion_text, finish_reason="stop")
       ],
       usage={
         "prompt_tokens": int(prompt_tokens),
         "completion_tokens": int(completion_tokens),
         "total_tokens": int(prompt_tokens + completion_tokens),
       },
-      extra=payload.extra or None,
+      extra=extra or None,
     )
     return JSONResponse(content=json.loads(response.json()))
 

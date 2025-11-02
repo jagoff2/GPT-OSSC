@@ -280,11 +280,16 @@ class GPTOSSHookedModel:
       return parsed.final.strip()
     return self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
 
-  def workspace_step(self, toggles: HookToggles, logits: torch.Tensor) -> ControllerOutput:
+  def workspace_step(
+    self,
+    toggles: HookToggles,
+    logits: torch.Tensor,
+  ) -> Tuple[ControllerOutput, Optional[MemoryEntry]]:
     effective = self._apply_feature_flags(toggles)
     self._current_entropy = batch_entropy_floor(logits)
     slots = self._prepare_slots(effective)
     decision = self._controller_step(slots, logits)
+    pending_entry: Optional[MemoryEntry] = None
     if effective.kv_append and decision.broadcast and slots is not None:
       device = str(self.primary_device())
       for layer_idx in self.config.hooked_layers:
@@ -296,7 +301,7 @@ class GPTOSSHookedModel:
         self.kv_projector(slots, layer_idx, device, target_dtype, plan_energy=plan_energy)
     if decision.write_memory and slots is not None:
       snapshot = slots.detach().cpu().reshape(-1).tolist()
-      entry = MemoryEntry(
+      pending_entry = MemoryEntry(
         time=time.time(),
         goal="generation",
         decision="broadcast" if decision.broadcast else "observe",
@@ -305,10 +310,9 @@ class GPTOSSHookedModel:
         tags=["generation"],
         text="",
       )
-      self.memory.add(entry)
     self.kv_projector.advance_step()
     self._layer_residuals.clear()
-    return decision
+    return decision, pending_entry
 
   def runtime_context(self, toggles: HookToggles):
     if not (toggles.kv_append or toggles.residual_delta or toggles.read_probes or toggles.broadcast):

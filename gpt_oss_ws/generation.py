@@ -36,7 +36,7 @@ def generate_with_workspace(
   request: GenerationRequestContext,
   input_ids: torch.Tensor,
   attention_mask: Optional[torch.Tensor] = None,
-  max_new_tokens: int = 256,
+  max_new_tokens: int = 4096,
   temperature: float = 0.8,
   top_p: float = 0.95,
   eos_token_id: Optional[int] = None,
@@ -52,6 +52,7 @@ def generate_with_workspace(
   cache: Optional[Cache] = None
   generated_tokens = []
   full_input = input_ids
+  prompt_length = input_ids.shape[-1]
   for step in range(max_new_tokens):
     step_input = full_input if cache is None else full_input[:, -1:]
     total_length = full_input.shape[-1]
@@ -95,12 +96,21 @@ def generate_with_workspace(
     if isinstance(new_cache, tuple):
       new_cache = DynamicCache.from_legacy_cache(new_cache)
     cache = new_cache
-    decision = model.workspace_step(request.toggles, outputs.logits)
+    decision, pending_entry = model.workspace_step(request.toggles, outputs.logits)
     next_token = _sample_next_token(logits, temperature, top_p)
     generated_tokens.append(next_token)
     next_token_unsqueezed = next_token.unsqueeze(-1)
     full_input = torch.cat([full_input, next_token_unsqueezed], dim=-1)
     attention_mask = torch.cat([attention_mask, torch.ones_like(next_token_unsqueezed)], dim=-1)
+    if pending_entry is not None:
+      generated_slice = full_input[:, prompt_length:]
+      if generated_slice.numel() > 0:
+        token_view = generated_slice[0].detach().cpu()
+        decoded = model.tokenizer.decode(token_view.tolist(), skip_special_tokens=True)
+        if not decoded:
+          decoded = model.tokenizer_decode(token_view)
+        pending_entry.text = decoded
+        model.memory.add(pending_entry)
     if stream_callback:
       stream_callback(next_token_unsqueezed, logits)
     if eos_token_id is not None and (next_token == eos_token_id).all():
