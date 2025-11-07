@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import WorkspaceConfig, load_config
@@ -28,7 +28,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
   model: str
   messages: List[ChatMessage]
-  max_tokens: int = Field(default=256, alias="max_tokens")
+  max_tokens: int = Field(default=64000, alias="max_tokens")
   temperature: float = 0.0
   top_p: float = 1.0
   stream: bool = False
@@ -54,7 +54,7 @@ class ChatCompletionResponse(BaseModel):
 class CompletionRequest(BaseModel):
   model: str
   prompt: Sequence[str] | str
-  max_tokens: int = Field(default=256, alias="max_tokens")
+  max_tokens: int = Field(default=64000, alias="max_tokens")
   temperature: float = 0.0
   top_p: float = 1.0
   stream: bool = False
@@ -117,6 +117,20 @@ class ServerState:
         torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
       except Exception as exc:  # pragma: no cover
         self.logger.warning("Unable to configure cuDNN determinism: %s", exc)
+    if config.retro.enabled:
+      self.logger.info(
+        "Retro refinement generation enabled",
+        extra={
+          "margin": config.retro.margin,
+          "window": config.retro.window,
+          "max_retracts": config.retro.max_retracts,
+          "retro_iters": config.retro.retro_iters,
+          "damping": config.retro.damping,
+          "chunk_size": config.retro.chunk_size or config.chunk_size or 128,
+          "edit_budget": config.retro.edit_budget,
+          "max_tokens": config.retro.max_tokens,
+        },
+      )
 
   def shutdown(self) -> None:
     self.logger.info("Shutting down workspace model")
@@ -132,14 +146,36 @@ class ServerState:
     _set_seed(seed)
 
   def reset_runtime(self) -> None:
-    self.model._current_plan_energy = None  # type: ignore[attr-defined]
-    self.model._current_slots = None  # type: ignore[attr-defined]
-    self.model._layer_residuals.clear()  # type: ignore[attr-defined]
+    if hasattr(self.model, "reset_workspace_state"):
+      try:
+        self.model.reset_workspace_state()  # type: ignore[attr-defined]
+      except Exception:
+        pass
+    else:
+      if hasattr(self.model, "_current_plan_energy"):
+        self.model._current_plan_energy = None  # type: ignore[attr-defined]
+      if hasattr(self.model, "_current_slots"):
+        self.model._current_slots = None  # type: ignore[attr-defined]
+      if hasattr(self.model, "_layer_residuals"):
+        try:
+          self.model._layer_residuals.clear()  # type: ignore[attr-defined]
+        except Exception:
+          self.model._layer_residuals = {}  # type: ignore[attr-defined]
 
   def clear_virtual_kv(self) -> None:
-    store_cls = self.model.kv_projector.store.__class__
-    layer_cnt = len(self.model.kv_projector.layer_ids)
-    self.model.kv_projector.store = store_cls(layer_cnt, self.config.retention)
+    kv_projector = getattr(self.model, "kv_projector", None)
+    if kv_projector is None:
+      return
+    store = getattr(kv_projector, "store", None)
+    layer_ids = getattr(kv_projector, "layer_ids", None)
+    if store is None or layer_ids is None:
+      return
+    store_cls = store.__class__
+    layer_cnt = len(layer_ids)
+    try:
+      kv_projector.store = store_cls(layer_cnt, self.config.retention)
+    except Exception:
+      pass
 
   def reset_chat_history(self) -> None:
     with self._history_lock:
@@ -150,6 +186,10 @@ class ServerState:
     with self._text_lock:
       self.completion_history = ""
     self.clear_virtual_kv()
+
+  def generate_tokens(self, request_ctx: GenerationRequestContext, **kwargs) -> torch.Tensor:
+    generation_fn = self.model.generate_retro if self.config.retro.enabled else self.model.generate
+    return generation_fn(request_ctx, **kwargs)
 
 
 def _normalize_prompt(prompt: Sequence[str] | str) -> str:
@@ -213,8 +253,6 @@ def create_app(
       raise HTTPException(status_code=400, detail="model mismatch")
 
     extra = dict(payload.extra or {})
-    if payload.stream:
-      extra["warning"] = "Streaming is not supported in this build; returning full response."
     reset = bool(extra.pop("reset_history", False))
 
     default_system = {
@@ -264,43 +302,18 @@ def create_app(
 
     state.reset_runtime()
     state.apply_seed(seed_value)
-    tokens = state.model.generate(
+    tokens = state.generate_tokens(
       request_ctx,
       input_ids=input_ids,
       attention_mask=attention_mask,
       max_new_tokens=max_new_tokens,
       temperature=temperature,
       top_p=top_p,
+      chunk_size=config.chunk_size,
     )
     state.reset_runtime()
 
     assistant_text = _decode_tokens(state, tokens, prompt_tokens)
-    last_assistant = None
-    with state._history_lock:
-      for entry in reversed(state.chat_history):
-        if entry["role"] == "assistant":
-          last_assistant = entry["content"]
-          break
-    if last_assistant and assistant_text.strip() == last_assistant.strip():
-      fallback_temperature = max(0.7, temperature if temperature > 0 else 0.7)
-      fallback_top_p = top_p if top_p < 0.95 else 0.95
-      if fallback_temperature != temperature or fallback_top_p != top_p:
-        state.reset_runtime()
-        alt_seed = state.next_seed()
-        state.apply_seed(alt_seed)
-        tokens_alt = state.model.generate(
-          request_ctx,
-          input_ids=input_ids,
-          attention_mask=attention_mask,
-          max_new_tokens=max_new_tokens,
-          temperature=fallback_temperature,
-          top_p=fallback_top_p,
-        )
-        state.reset_runtime()
-        alt_text = _decode_tokens(state, tokens_alt, prompt_tokens)
-        if alt_text.strip() != last_assistant.strip():
-          assistant_text = alt_text
-          tokens = tokens_alt
 
     with state._history_lock:
       state.chat_history.append({"role": "assistant", "content": assistant_text})
@@ -325,6 +338,24 @@ def create_app(
       },
       extra=extra or None,
     )
+    if payload.stream:
+      async def event_stream():
+        chunk = {
+          "id": request_ctx.request_id,
+          "object": "chat.completion.chunk",
+          "created": int(time.time()),
+          "model": payload.model,
+          "choices": [
+            {
+              "index": 0,
+              "delta": {"role": "assistant", "content": assistant_text},
+              "finish_reason": None,
+            }
+          ],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+      return StreamingResponse(event_stream(), media_type="text/event-stream")
     return JSONResponse(content=json.loads(response.json()))
 
   @app.post("/v1/completions")
@@ -333,8 +364,6 @@ def create_app(
       raise HTTPException(status_code=400, detail="model mismatch")
 
     extra = dict(payload.extra or {})
-    if payload.stream:
-      extra["warning"] = "Streaming is not supported in this build; returning full response."
     reset = bool(extra.pop("reset_history", False))
 
     if reset:
@@ -359,13 +388,14 @@ def create_app(
 
     state.reset_runtime()
     state.apply_seed(seed_value)
-    tokens = state.model.generate(
+    tokens = state.generate_tokens(
       request_ctx,
       input_ids=input_ids,
       attention_mask=attention_mask,
       max_new_tokens=max_new_tokens,
       temperature=temperature,
       top_p=top_p,
+      chunk_size=config.chunk_size,
     )
     state.reset_runtime()
 
@@ -390,6 +420,24 @@ def create_app(
       },
       extra=extra or None,
     )
+    if payload.stream:
+      async def event_stream():
+        chunk = {
+          "id": request_ctx.request_id,
+          "object": "text_completion.chunk",
+          "created": int(time.time()),
+          "model": payload.model,
+          "choices": [
+            {
+              "index": 0,
+              "text": completion_text,
+              "finish_reason": None,
+            }
+          ],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+      return StreamingResponse(event_stream(), media_type="text/event-stream")
     return JSONResponse(content=json.loads(response.json()))
 
   return app

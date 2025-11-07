@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
@@ -14,7 +14,7 @@ class VirtualKVProjector(nn.Module):
     self,
     config: WorkspaceConfig,
     hidden_size: int,
-    target_dtype: torch.dtype,
+    target_dtype: Optional[torch.dtype] = None,
     workspace_dtype: Optional[torch.dtype] = None,
   ) -> None:
     super().__init__()
@@ -31,7 +31,8 @@ class VirtualKVProjector(nn.Module):
     self.layer_ids = list(config.hooked_layers)
     self.layer_to_slot: Dict[int, int] = {layer: idx for idx, layer in enumerate(self.layer_ids)}
     self.store = VirtualKVStore(len(self.layer_ids), config.retention)
-    self.output_dtype = workspace_dtype or target_dtype
+    base_dtype = target_dtype or torch.float32
+    self.output_dtype = workspace_dtype or base_dtype
     if workspace_dtype is not None and self.linear.weight.dtype != workspace_dtype:
       self.linear = self.linear.to(dtype=workspace_dtype)
 
@@ -45,6 +46,9 @@ class VirtualKVProjector(nn.Module):
     plan_val_matrix = plan_val_matrix / plan_val_matrix.norm(dim=0, keepdim=True).clamp_min(1e-6)
     self.register_buffer("plan_key_matrix", plan_key_matrix.to(dtype=self.output_dtype))
     self.register_buffer("plan_value_matrix", plan_val_matrix.to(dtype=self.output_dtype))
+    self.register_buffer("plan_scale", torch.tensor(config.kv_plan_scale, dtype=torch.float32))
+    self.register_buffer("plan_bias", torch.tensor(config.kv_plan_bias, dtype=torch.float32))
+    self.projection_scale = float(config.kv_projection_scale)
 
   def forward(
     self,
@@ -61,16 +65,22 @@ class VirtualKVProjector(nn.Module):
       slots = slots.to(dtype=linear_dtype)
     pooled = slots.mean(dim=1)
     projected = self.linear(pooled)
+    if self.projection_scale != 1.0:
+      projected = projected * self.projection_scale
     total = self.kv_heads * self.nvirt * self.head_dim
     key_flat = projected[:, :total]
     value_flat = projected[:, total:]
     if plan_energy is not None:
       base_dtype = pooled.dtype
-      pe = plan_energy.to(base_dtype)
-      plan_drive = torch.matmul(pooled, self.plan_key_matrix).to(base_dtype)
-      plan_weight = torch.sigmoid(pe.unsqueeze(-1))
+      tensor_device = pooled.device
+      pe = plan_energy.to(device=tensor_device, dtype=base_dtype)
+      plan_drive = torch.matmul(pooled, self.plan_key_matrix).to(device=tensor_device, dtype=base_dtype)
+      scale = self.plan_scale.to(device=tensor_device, dtype=base_dtype)
+      bias = self.plan_bias.to(device=tensor_device, dtype=base_dtype)
+      scaled_energy = scale * pe.unsqueeze(-1) + bias
+      plan_weight = torch.sigmoid(scaled_energy)
       key_flat = key_flat + plan_weight * plan_drive
-      plan_value_drive = torch.matmul(pooled, self.plan_value_matrix).to(base_dtype)
+      plan_value_drive = torch.matmul(pooled, self.plan_value_matrix).to(device=tensor_device, dtype=base_dtype)
       value_flat = value_flat + plan_weight * plan_value_drive
     key = key_flat.view(bsz, self.kv_heads, self.nvirt, self.head_dim)
     value = value_flat.view(bsz, self.kv_heads, self.nvirt, self.head_dim)

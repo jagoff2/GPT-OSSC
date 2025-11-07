@@ -1,0 +1,5 @@
+Summarize the core idea of reinforcement learning in two sentences.
+Explain how transformers differ from recurrent neural networks in a concise paragraph.
+List three practical tips for optimizing PyTorch models on CPU-only machines.
+Outline a short plan for debugging failed language-model generations.
+Provide a haiku about deterministic algorithms.

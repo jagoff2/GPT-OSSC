@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 import time
@@ -102,6 +103,8 @@ def interactive_compare(
 ) -> None:
   cfg, model = _load_model(config_path)
   _set_seed(seed)
+  if "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
   try:
     torch.use_deterministic_algorithms(True)
   except Exception:

@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 
 from gpt_oss_ws.config import WorkspaceConfig, RetentionConfig
 

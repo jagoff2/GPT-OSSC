@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 
 from gpt_oss_ws.config import RetentionConfig
 from gpt_oss_ws.scheduling import VirtualKVSegment, VirtualKVStore

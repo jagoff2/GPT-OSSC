@@ -1,4 +1,4 @@
-﻿from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient
 from unittest.mock import patch
 
 from gpt_oss_ws.api_server import create_app

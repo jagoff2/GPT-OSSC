@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 
 from gpt_oss_ws.config import WorkspaceConfig
 from gpt_oss_ws.residual_delta import ResidualDeltaHook

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import contextlib
 import contextvars
@@ -39,6 +39,8 @@ class WorkspaceRuntimeState:
   slots: Optional[torch.Tensor] = None
   entropy: float = 0.0
   model_dtype: Optional[torch.dtype] = None
+  log_kv_metrics: bool = False
+  kv_metrics: Dict[int, Dict[str, float]] = field(default_factory=dict)
 
 
 def _append_virtual_to_past(
@@ -120,7 +122,26 @@ class _VirtualCacheProxy:
         virtual_k = virtual_k.to(dtype=target_dtype)
       if virtual_v.dtype != target_dtype:
         virtual_v = virtual_v.to(dtype=target_dtype)
+      runtime_state: Optional[WorkspaceRuntimeState] = RuntimeVar.get()
+      real_norm = virtual_norm = combined_norm = None
+      if runtime_state is not None and getattr(runtime_state, "log_kv_metrics", False):
+        with torch.no_grad():
+          real_norm = key_states.float().norm(dim=-1).mean().item()
+          virtual_norm = virtual_k.float().norm(dim=-1).mean().item()
       key_states, value_states = _append_virtual_to_past((key_states, value_states), virtual_k, virtual_v)
+      if runtime_state is not None and getattr(runtime_state, "log_kv_metrics", False):
+        with torch.no_grad():
+          combined_norm = key_states.float().norm(dim=-1).mean().item()
+        ratio = 0.0
+        if real_norm and real_norm != 0.0:
+          ratio = float(virtual_norm or 0.0) / float(real_norm)
+        runtime_state.kv_metrics[self._layer_idx] = {
+          "real_norm": float(real_norm) if real_norm is not None else 0.0,
+          "virtual_norm": float(virtual_norm) if virtual_norm is not None else 0.0,
+          "combined_norm": float(combined_norm) if combined_norm is not None else 0.0,
+          "virtual_tokens": int(virtual_k.shape[-2]),
+          "ratio": ratio,
+        }
     return key_states, value_states
 
   def __getattr__(self, name: str):

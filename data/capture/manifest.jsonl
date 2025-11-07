@@ -1,0 +1,5 @@
+{"id": "00000", "file": "00000.pt", "prompt": "Summarize the core idea of reinforcement learning in two sentences.", "seed": 1234}
+{"id": "00001", "file": "00001.pt", "prompt": "Explain how transformers differ from recurrent neural networks in a concise paragraph.", "seed": 1235}
+{"id": "00002", "file": "00002.pt", "prompt": "List three practical tips for optimizing PyTorch models on CPU-only machines.", "seed": 1236}
+{"id": "00003", "file": "00003.pt", "prompt": "Outline a short plan for debugging failed language-model generations.", "seed": 1237}
+{"id": "00004", "file": "00004.pt", "prompt": "Provide a haiku about deterministic algorithms.", "seed": 1238}

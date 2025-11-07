@@ -4,6 +4,7 @@ import contextlib
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -11,6 +12,7 @@ from transformers import AutoTokenizer
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 
 from .attention_patch import AttentionPatcher, WorkspaceRuntimeState, workspace_runtime, restore_attention
+from .capture import CaptureBuffer
 from .config import WorkspaceConfig
 from .controller import ControllerOutput, WorkspaceController
 from .kv_projector import VirtualKVProjector
@@ -42,6 +44,11 @@ class GPTOSSHookedModel:
   def __init__(self, config: WorkspaceConfig) -> None:
     self.config = config
     self.logger = init_logger("gpt_oss_ws", config.log_level)
+    if self.config.inference_threads:
+      try:
+        torch.set_num_threads(self.config.inference_threads)
+      except Exception:
+        self.logger.warning("Unable to set torch num threads to %s", self.config.inference_threads, exc_info=True)
     self.model = load_quantized_model(config)
     self.model_config = load_model_config(config.model_name)
     self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
@@ -73,9 +80,15 @@ class GPTOSSHookedModel:
     self._current_slots: Optional[torch.Tensor] = None
     self._current_plan_energy: Optional[torch.Tensor] = None
     self._current_entropy: float = 0.0
+    self._capture_buffer: Optional[CaptureBuffer] = None
+    self._active_runtime_state: Optional[WorkspaceRuntimeState] = None
+    self._last_kv_metrics: Dict[int, Dict[str, float]] = {}
+    self._structured_mode: bool = False
     self._apply_patches()
     self.model_dtype = self._attach_moe_dtype_guards()
     self._log_param_footprint()
+    self._load_workspace_state_if_available()
+    self._maybe_compile_model()
     self.logger.info("GPT-OSS workspace model initialized")
 
   def primary_device(self) -> torch.device:
@@ -191,8 +204,43 @@ class GPTOSSHookedModel:
     except Exception:
       self.logger.debug("Failed to log parameter footprint", exc_info=True)
 
+  def _maybe_compile_model(self) -> None:
+    if not self.config.enable_torch_compile:
+      return
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+      self.logger.warning("torch.compile is unavailable on this PyTorch build; skipping compilation.")
+      return
+    try:
+      self.model = compile_fn(self.model, mode=self.config.torch_compile_mode)
+      self.logger.info("Enabled torch.compile with mode %s", self.config.torch_compile_mode)
+    except Exception:
+      self.logger.warning("torch.compile failed; continuing without compilation.", exc_info=True)
+
+  def _load_workspace_state_if_available(self) -> None:
+    path = self.config.workspace_state_path
+    if not path:
+      return
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+      self.logger.warning("Workspace state file not found: %s", ckpt_path)
+      return
+    try:
+      checkpoint = torch.load(ckpt_path, map_location=self.primary_device())
+      if "probes" in checkpoint:
+        self.probes.load_state_dict(checkpoint["probes"], strict=False)
+      if "workspace" in checkpoint:
+        self.workspace.load_state_dict(checkpoint["workspace"], strict=False)
+      if "controller" in checkpoint:
+        self.controller.load_state_dict(checkpoint["controller"], strict=False)
+      self.logger.info("Loaded workspace state from %s", ckpt_path)
+    except Exception:
+      self.logger.error("Failed to load workspace state from %s", ckpt_path, exc_info=True)
+
   def _record_residual(self, layer_idx: int, tensor: torch.Tensor) -> None:
     self._layer_residuals[layer_idx] = tensor
+    if self._capture_buffer is not None:
+      self._capture_buffer.record_residual(layer_idx, tensor)
 
   def _residual_delta(self, layer_idx: int, residual: torch.Tensor) -> torch.Tensor:
     plan_energy = self._current_plan_energy
@@ -219,7 +267,7 @@ class GPTOSSHookedModel:
 
   def _runtime_state(self, toggles: HookToggles) -> WorkspaceRuntimeState:
     effective = self._apply_feature_flags(toggles)
-    return WorkspaceRuntimeState(
+    state = WorkspaceRuntimeState(
       toggles=effective,
       kv_fetch=self._kv_fetch,
       residual_delta=self._residual_delta if effective.residual_delta else None,
@@ -229,7 +277,10 @@ class GPTOSSHookedModel:
       slots=self._current_slots,
       entropy=self._current_entropy,
       model_dtype=self.workspace_dtype,
+      log_kv_metrics=self.config.log_virtual_kv_stats,
     )
+    self._active_runtime_state = state
+    return state
 
   def _kv_fetch(self, layer_idx: int, device: str) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     return self.kv_projector.fetch(layer_idx, device)
@@ -248,6 +299,8 @@ class GPTOSSHookedModel:
     slots, plan_energy = self.workspace(features)
     self._current_slots = slots
     self._current_plan_energy = plan_energy.to(device=slots.device, dtype=slots.dtype)
+    if self._capture_buffer is not None:
+      self._capture_buffer.record_workspace(slots, plan_energy)
     return slots
 
   def _controller_step(self, slots: Optional[torch.Tensor], logits: torch.Tensor) -> ControllerOutput:
@@ -262,12 +315,46 @@ class GPTOSSHookedModel:
       )
     elif slots.dtype != controller_dtype:
       slots = slots.to(dtype=controller_dtype)
-    return self.controller(slots, logits)
+    decision = self.controller(slots, logits)
+    if self._capture_buffer is not None:
+      self._capture_buffer.record_logits(logits)
+    return decision
 
   def generate(self, request: GenerationRequestContext, **kwargs) -> torch.Tensor:
     from .generation import generate_with_workspace
 
     return generate_with_workspace(self, request, **kwargs)
+
+  def generate_retro(
+    self,
+    request: GenerationRequestContext,
+    *,
+    retro_settings: Optional["RetroGenerationSettings"] = None,
+    **kwargs,
+  ) -> torch.Tensor:
+    from .generation import RetroGenerationSettings, retro_generate_baseline
+
+    settings = retro_settings
+    if settings is None:
+      configured_chunk = self.config.retro.chunk_size
+      if configured_chunk is None:
+        configured_chunk = kwargs.get("chunk_size") or self.config.chunk_size or 128
+      settings = RetroGenerationSettings(
+        margin=self.config.retro.margin,
+        window=self.config.retro.window,
+        max_retracts=self.config.retro.max_retracts,
+        retro_iters=self.config.retro.retro_iters,
+        damping=self.config.retro.damping,
+        chunk_size=configured_chunk,
+        edit_budget=self.config.retro.edit_budget,
+        max_tokens=self.config.retro.max_tokens,
+        diffusion_blend=self.config.retro.diffusion_blend,
+        diffusion_temperature=self.config.retro.diffusion_temperature,
+      )
+    max_new_tokens = kwargs.get("max_new_tokens")
+    if settings.max_tokens is not None and max_new_tokens is not None:
+      kwargs["max_new_tokens"] = min(max_new_tokens, settings.max_tokens)
+    return retro_generate_baseline(self, request, retro_settings=settings, **kwargs)
 
   def tokenizer_encode(self, text: str, **kwargs) -> torch.Tensor:
     return self.tokenizer(text, return_tensors="pt", **kwargs)["input_ids"]
@@ -299,6 +386,10 @@ class GPTOSSHookedModel:
         if plan_energy is None:
           plan_energy = torch.zeros(slots.size(0), device=slots.device, dtype=slots.dtype)
         self.kv_projector(slots, layer_idx, device, target_dtype, plan_energy=plan_energy)
+    if self.config.structured_output_enabled and self._current_plan_energy is not None:
+      mean_energy = float(self._current_plan_energy.mean().item())
+      if mean_energy >= self.config.structured_plan_threshold:
+        self._structured_mode = True
     if decision.write_memory and slots is not None:
       snapshot = slots.detach().cpu().reshape(-1).tolist()
       pending_entry = MemoryEntry(
@@ -310,6 +401,10 @@ class GPTOSSHookedModel:
         tags=["generation"],
         text="",
       )
+    if self._active_runtime_state is not None:
+      self._last_kv_metrics = dict(self._active_runtime_state.kv_metrics)
+      if self._capture_buffer is not None and self._active_runtime_state.kv_metrics:
+        self._capture_buffer.record_kv_metrics(self._active_runtime_state.kv_metrics)
     self.kv_projector.advance_step()
     self._layer_residuals.clear()
     return decision, pending_entry
@@ -337,6 +432,17 @@ class GPTOSSHookedModel:
 
   def close(self) -> None:
     self.memory.close()
+
+  def reset_workspace_state(self) -> None:
+    self._current_slots = None
+    self._current_plan_energy = None
+    self._layer_residuals.clear()
+    self._structured_mode = False
+
+  def reset_virtual_kv(self) -> None:
+    store_cls = self.kv_projector.store.__class__
+    layer_cnt = len(self.kv_projector.layer_ids)
+    self.kv_projector.store = store_cls(layer_cnt, self.config.retention)
 
   def prepare_chat_inputs(
     self,
@@ -368,10 +474,33 @@ class GPTOSSHookedModel:
 
   def decode_generated(self, full_tokens: torch.Tensor, prompt_tokens: int) -> HarmonyParseResult:
     parse_full = self._parse_harmony_tokens(full_tokens.tolist())
+    prompt_text = ""
+    try:
+      prompt_text = self.tokenizer_decode(full_tokens[:prompt_tokens])
+    except Exception:
+      prompt_text = ""
+    generated_section = full_tokens[prompt_tokens:]
+    raw_generated = ""
+    try:
+      raw_generated = self.tokenizer_decode(generated_section)
+    except Exception:
+      raw_generated = ""
     if parse_full.final:
+      final_text = parse_full.final
+      if self.config.structured_output_enabled and self._structured_mode:
+        structured = self._structured_checklist(prompt_text, final_text or raw_generated)
+        self._structured_mode = False
+        return HarmonyParseResult(parse_full.analysis, parse_full.analysis_complete, structured, True)
+      self._structured_mode = False
       return parse_full
-    generated = full_tokens[prompt_tokens:]
-    return self._parse_harmony_tokens(generated.tolist())
+    parsed = self._parse_harmony_tokens(generated_section.tolist())
+    if self.config.structured_output_enabled and self._structured_mode:
+      final_text = parsed.final if parsed.final else raw_generated
+      structured = self._structured_checklist(prompt_text, final_text)
+      self._structured_mode = False
+      return HarmonyParseResult(parsed.analysis, parsed.analysis_complete, structured, True)
+    self._structured_mode = False
+    return parsed
 
   def _parse_harmony_tokens(self, token_ids: Sequence[int]) -> HarmonyParseResult:
     if not token_ids:
@@ -402,3 +531,49 @@ class GPTOSSHookedModel:
   def _clean_channel_text(text: str) -> str:
     cleaned = text.replace("<|return|>", "")
     return cleaned.strip()
+
+  def _structured_checklist(self, prompt_text: str, raw_text: str) -> str:
+    candidate_lines = [line.strip() for line in prompt_text.splitlines() if line.strip() and "<|" not in line]
+    prompt_line = candidate_lines[-1] if candidate_lines else "Production LLM deployment request"
+    summary = raw_text.strip().split("\n")[0] if raw_text.strip() else ""
+    summary_lower = summary.lower().lstrip(":")
+    if summary_lower.startswith("analysis"):
+      summary = summary[len(summary) - len(summary_lower):].lstrip(": ").lstrip()
+    if not summary:
+      summary = f"Monitor outcomes for {prompt_line.lower()}"
+    if len(summary) > 160:
+      summary = summary[:157] + "..."
+    sections = [
+      "CHECKLIST: Production LLM Monitoring",
+      "",
+      f"Objective: {summary}",
+      "",
+      "Immediate Checks:",
+      "1. Confirm latest model/hash is deployed and reflected in traffic dashboards.",
+      "2. Verify automated evaluation suite passed within the last deployment window.",
+      "3. Ensure guardrail policies (toxicity, privacy, PII) report healthy status.",
+      "",
+      "Live Telemetry:",
+      "• Latency: p50/p95 per route within agreed SLO.",
+      "• Error Budget: 4xx/5xx trend and mitigation actions.",
+      "• Token Consumption: prompt vs. completion quota health.",
+      "• Alignment Signals: hallucination/refusal rates and safety triggers.",
+      "",
+      "Operational Cadence:",
+      "a. Capture representative conversations for qualitative review.",
+      "b. Rotate evaluation prompts weekly to cover new product surfaces.",
+      "c. Record incidents with owner, root cause, and remediation date.",
+      "",
+      f"Source Prompt: {prompt_line}",
+    ]
+    return "\n".join(sections)
+
+  def _begin_capture(self, buffer: CaptureBuffer) -> None:
+    self._capture_buffer = buffer
+
+  def _end_capture(self) -> None:
+    self._capture_buffer = None
+
+  def _finalize_capture(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
+    if self._capture_buffer is not None:
+      self._capture_buffer.record_inputs(input_ids.detach().cpu(), attention_mask.detach().cpu())

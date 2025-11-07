@@ -1,0 +1,25 @@
+model_name: openai/gpt-oss-20b
+quantization: Mxfp4
+workspace_device: cpu
+slot_count: 2
+slot_dim: 64
+slot_iterations: 1
+hooked_layers: [1, 9, 17]
+enable_residual_delta: true
+enable_read_probes: true
+enable_broadcast: true
+enable_kv_append: true
+log_virtual_kv_stats: true
+kv_plan_scale: 1.5
+kv_plan_bias: -0.25
+kv_projection_scale: 0.8
+enable_torch_compile: false
+inference_threads: 8
+chunk_size: 64
+workspace_state_path: data/capture/workspace_trained.pt
+retention:
+  virt_kv_max_tokens_per_layer: 256
+  virt_kv_ttl_steps: 256
+  spill_to_cpu: true
+structured_output_enabled: true
+structured_plan_threshold: 0.2

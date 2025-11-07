@@ -1,1 +1,1 @@
-﻿"""CLI package for gpt-oss-ws."""
+"""CLI package for gpt-oss-ws."""

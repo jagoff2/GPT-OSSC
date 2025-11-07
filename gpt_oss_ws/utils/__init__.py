@@ -1,1 +1,1 @@
-﻿"""Utility subpackage."""
+"""Utility subpackage."""

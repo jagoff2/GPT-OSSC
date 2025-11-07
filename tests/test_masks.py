@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 
 from gpt_oss_ws.masks import extend_causal_mask
 

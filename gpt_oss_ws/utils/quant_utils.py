@@ -27,12 +27,17 @@ def load_quantized_model(config: WorkspaceConfig) -> AutoModelForCausalLM:
     quantization_config: Dict[str, Any] = {}
     int8_static = False
     force_cpu_device_map = False
-    if config.quantization == "Mxfp4":
+
+    quant_mode = (config.quantization or "").lower()
+
+    if quant_mode == "mxfp4":
+        # Let the HF loader manage dtype so packed weights stay in MXFP4 form.
+        # MXFP4 kernels expect bf16 activations, so force the workspace path to bf16.
+        torch_dtype = None
+        config.bf16_fallback = True
+    elif quant_mode == "fp32":
         torch_dtype = torch.float32
-        # MXFP4 quantization is not supported on this runtime; fall back to float32 for compatibility
-    elif config.quantization == "fp32":
-        torch_dtype = torch.float32
-    elif config.quantization == "bnb-4bit":
+    elif quant_mode == "bnb-4bit":
         from transformers import BitsAndBytesConfig
 
         quantization_config = {
@@ -44,9 +49,9 @@ def load_quantized_model(config: WorkspaceConfig) -> AutoModelForCausalLM:
             )
         }
         load_in_4bit = True
-    elif config.quantization == "bf16":
+    elif quant_mode == "bf16":
         torch_dtype = torch.bfloat16
-    elif config.quantization == "int8":
+    elif quant_mode == "int8":
         cuda_available = torch.cuda.is_available() and torch.cuda.device_count() > 0
         windows_runtime = platform.system().lower().startswith("windows")
         if not cuda_available or windows_runtime or config.device_map == "cpu":

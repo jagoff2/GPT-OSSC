@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 from torch import nn
 
 from gpt_oss_ws.attention_patch import AttentionPatcher, WorkspaceRuntimeState, workspace_runtime

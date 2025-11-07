@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -34,7 +34,7 @@ class ResidualDeltaHook(nn.Module):
     slots: torch.Tensor,
     entropy: float,
     entropy_floor: float,
-    plan_energy: torch.Tensor,
+    plan_energy: Optional[torch.Tensor] = None,
   ) -> torch.Tensor:
     if slots is None or residual.size(1) == 0:
       return residual
@@ -46,8 +46,11 @@ class ResidualDeltaHook(nn.Module):
     slot_avg = slots.mean(dim=1)
     if slot_avg.dtype != target_dtype:
       slot_avg = slot_avg.to(dtype=target_dtype)
-    plan_energy = plan_energy.to(target_dtype)
-    energy_term = torch.tanh(plan_energy).unsqueeze(-1).to(target_dtype)
+    if plan_energy is None:
+      plan_energy = torch.zeros(residual.size(0), device=residual.device, dtype=target_dtype)
+    else:
+      plan_energy = plan_energy.to(device=residual.device, dtype=target_dtype)
+    energy_term = torch.tanh(plan_energy).unsqueeze(-1)
 
     gate_scalar = torch.sigmoid(self.gate[hooked_idx]).to(target_dtype)
     gate = gate_scalar * (1.0 + energy_term.squeeze(-1))
